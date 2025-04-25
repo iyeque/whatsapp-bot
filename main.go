@@ -308,6 +308,24 @@ func (b *Bot) handlePresence(evt interface{}) {
 	}
 }
 
+func (b *Bot) startPresenceKeeper(ctx context.Context) {
+	// Maintain online presence by periodically refreshing status
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				if err := b.SetPresence(PresenceAvailable); err != nil {
+					fmt.Printf("Failed to refresh online presence: %v\n", err)
+				}
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
 func setupLogging() (*os.File, error) {
 	logPath := filepath.Join("logs", LOG_FILE)
 	// Create logs directory if it doesn't exist
@@ -388,6 +406,11 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Connected:
 			fmt.Println("WhatsApp connection established!")
+			// Set bot as online when connected and start presence keeper
+			if err := bot.SetPresence(PresenceAvailable); err != nil {
+				logger.Errorf("Failed to set online presence: %v", err)
+			}
+			bot.startPresenceKeeper(ctx)
 			connectionStatus <- "connected"
 		case *events.ConnectFailure:
 			fmt.Printf("Connection failed: %v\n", v.Reason)
