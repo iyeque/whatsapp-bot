@@ -1,31 +1,34 @@
 # WhatsApp GPT Bot
 
-A powerful WhatsApp bot that integrates with local AI models (like LM Studio) to provide automated responses, handle media, and manage conversations. Built with Go and modern best practices.
+A powerful WhatsApp bot that integrates with local AI models (like LM Studio) to provide automated responses, handle media, and manage multiple WhatsApp accounts simultaneously. Built with Go and modern best practices.
 
 ## Features
 
 - 🤖 Seamless integration with local AI models via OpenAI-compatible API
-- 📱 Full WhatsApp message support (text, images, documents)
-- 💬 Conversation history management with summarization
+- 📱 Support for multiple WhatsApp accounts
+- 💬 Full WhatsApp message support (text, images, documents)
+- 🧠 Conversation history management with summarization
 - ⚡ Rate limiting and throttling for stability
 - 🔄 Automatic reconnection and session management
-- 📊 Prometheus metrics for monitoring
+- 📊 Real-time performance dashboard with metrics
 - 🚀 High performance with Go concurrency
 - 🔒 Local data storage with SQLite
+- 🔄 Automatic cache management
+- ⏱️ Dynamic timeout adjustment
 
 ## Prerequisites
 
 - Go 1.23.0 or later
 - SQLite3
 - Local AI model server (e.g., LM Studio) with OpenAI API compatibility
-- WhatsApp account for bot usage
+- WhatsApp account(s) for bot usage
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/whatsapp-bot.git
-cd whatsapp-bot
+git clone https://github.com/yourusername/whatsapp-gpt-bot.git
+cd whatsapp-gpt-bot
 ```
 
 2. Install dependencies:
@@ -60,32 +63,54 @@ go build
 ./whatsapp-gpt-bot
 ```
 
-2. On first run, you'll see a QR code in the terminal. Scan this with WhatsApp on your phone to link the device.
+2. The bot now supports multiple WhatsApp accounts. Available commands:
+   - `new` - Create and connect a new bot instance (scan QR code)
+   - `list` - Show all active bot instances and their status
+   - `remove <bot_id>` - Disconnect and remove a specific bot
+   - `quit` - Safely shut down all bots and exit
 
-3. The bot will now:
-   - Automatically respond to messages using your local AI model
-   - Handle images and documents
-   - Maintain conversation history
-   - Show typing indicators
-   - Auto-reconnect if disconnected
+3. Managing Multiple Accounts:
+   - Start the bot and type `new` to add your first account
+   - Scan the QR code with WhatsApp to connect
+   - Repeat with `new` for additional accounts
+   - Use `list` to see all connected accounts
+   - Use `remove bot_1` to disconnect a specific account
+
+4. Features per Account:
+   - Independent conversation history
+   - Separate message caching
+   - Individual timeout management
+   - Isolated rate limiting
 
 ## Architecture
 
 The project is organized into several packages:
 
-- `main.go`: Bot initialization and core logic
-- `whatsapp/`: WhatsApp client implementation
+- `main.go`: Bot initialization and CLI interface
+- `whatsapp/`: WhatsApp client and multi-account management
 - `ai/`: AI client and interface implementations
-- `utils/`: Common utilities for retry logic and message handling
+- `utils/`: Common utilities and monitoring dashboard
+
+## Performance Dashboard
+
+Access the real-time performance dashboard at `http://localhost:8080/dashboard` to monitor:
+
+- System health metrics
+- Request performance
+- Timeout statistics
+- LM Studio performance
+- Memory usage
+- Active sessions
 
 ## Error Handling
 
 The bot includes robust error handling:
 
 - Automatic retries with exponential backoff
-- Session persistence
+- Session persistence per account
 - Graceful shutdown handling
 - Comprehensive logging
+- Dynamic timeout adjustment
 
 ## Troubleshooting
 
@@ -100,16 +125,11 @@ The bot includes robust error handling:
 - Check model is loaded in your local AI server
 - Try increasing AI_TIMEOUT for slower models
 
-### Compilation Problems
-- Ensure Go 1.23.0+ is installed: `go version`
-- Run `go mod tidy` to fix dependencies
-- Verify all required packages are available
-
-## Monitoring
-
-Prometheus metrics are available at `:9090/metrics`:
-- `whatsapp_bot_requests_total`: Message processing counter
-- `whatsapp_bot_request_duration_seconds`: Processing time histogram
+### Multiple Accounts
+- Each account needs a separate QR code scan
+- Use `list` to check connection status
+- If an account disconnects, use `remove` and add it again
+- Check logs for account-specific issues
 
 ## Contributing
 
