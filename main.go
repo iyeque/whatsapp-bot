@@ -86,53 +86,53 @@ func handleCommands(am *whatsapp.AccountManager, logger waLog.Logger) {
 		case "new":
 			bot, err := am.CreateNewBot()
 			if err != nil {
-				fmt.Printf("Error creating new bot: %v\n", err)
+				logger.Errorf("Error creating new bot: %v", err)
 				continue
 			}
 
 			if err := bot.Connect(); err != nil {
-				fmt.Printf("Error connecting bot: %v\n", err)
+				logger.Errorf("Error connecting bot: %v", err)
 				continue
 			}
 
-			fmt.Println("New bot instance created. Scan the QR code to connect...")
+			logger.Infof("New bot instance created. Scan the QR code to connect...")
 
 		case "list":
 			bots := am.ListBots()
 			if len(bots) == 0 {
-				fmt.Println("No active bots")
+				logger.Infof("No active bots")
 				continue
 			}
 
-			fmt.Println("\nActive bots:")
+			logger.Infof("Active bots:")
 			for id, bot := range bots {
 				connected := bot.IsConnected()
 				status := "disconnected"
 				if connected {
 					status = "connected"
 				}
-				fmt.Printf("- %s: %s\n", id, status)
+				logger.Infof("- %s: %s", id, status)
 			}
 
 		case "remove":
 			if len(args) < 2 {
-				fmt.Println("Please specify bot ID")
+				logger.Warnf("Please specify bot ID")
 				continue
 			}
 
 			if err := am.RemoveBot(args[1]); err != nil {
-				fmt.Printf("Error removing bot: %v\n", err)
+				logger.Errorf("Error removing bot: %v", err)
 			} else {
-				fmt.Printf("Bot %s removed successfully\n", args[1])
+				logger.Infof("Bot %s removed successfully", args[1])
 			}
 
 		case "quit":
-			fmt.Println("Shutting down...")
+			logger.Infof("Shutting down...")
 			am.DisconnectAll()
 			os.Exit(0)
 
 		default:
-			fmt.Println("Unknown command")
+			logger.Warnf("Unknown command: %s", args[0])
 		}
 	}
 }
