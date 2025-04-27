@@ -45,11 +45,11 @@ cp .env.example .env
 4. Configure your environment variables in `.env`:
 ```env
 DB_PATH=./whatsapp.db              # SQLite database path
-AI_ENDPOINT=http://localhost:1234/v1  # Local AI endpoint
-AI_TIMEOUT=30                      # Timeout for AI requests in seconds
+AI_ENDPOINT=http://localhost:1234/v1/chat/completions  # Local AI endpoint (matches LM_STUDIO_URL in bot.go)
+AI_TIMEOUT=30                      # Default timeout for AI requests in seconds (matches DEFAULT_TIMEOUT in bot.go)
 WHATSAPP_LOG_LEVEL=info           # Logging level (debug/info/warn/error)
 MAX_WHATSAPP_CHARS=4096           # Maximum characters per message
-MODEL_NAME=local-model            # Your AI model name
+MODEL_NAME=local-model            # Your AI model name (matches model in bot.go)
 CONTEXT_WINDOW=4096               # Maximum context window size
 SUMMARY_THRESHOLD=10              # Messages before summarization
 RATE_LIMIT_PER_SECOND=0.5        # Rate limit for message processing

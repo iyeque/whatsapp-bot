@@ -1,8 +1,10 @@
+
 package whatsapp
 
 import (
 	"context"
 	"encoding/json"
+	"github.com/skip2/go-qrcode"
 	"fmt"
 	"net/http"
 	"strings"
@@ -42,6 +44,7 @@ type Bot struct {
 	timeouts      *TimeoutManager
 	mutex         sync.RWMutex
 	cacheMux      sync.RWMutex
+	qrMux         sync.Mutex
 }
 
 type TimeoutManager struct {
@@ -59,6 +62,7 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container) *Bot {
 	}
 
 	client.AddEventHandler(bot.handleMessage)
+	client.AddEventHandler(bot.handleQREvent)
 	go bot.cleanupCache()
 
 	return bot
@@ -79,6 +83,11 @@ func (b *Bot) IsConnected() bool {
 	return b.client.IsConnected()
 }
 
+func (b *Bot) decodeAndSaveQR(qr string) {
+	qrCode, _ := qrcode.New(qr, qrcode.Medium)
+	fmt.Printf("\n\x1b[36m╔══════════════════════════════════╗\n║          SCAN QR CODE          ║\n╚══════════════════════════════════╝\n\x1b[0m\n%s\n\x1b[36mScan this QR code with your WhatsApp mobile app\x1b[0m\n\n", qrCode.ToSmallString(false))
+}
+
 const (
 	LM_STUDIO_URL   = "http://localhost:1234/v1/chat/completions"
 	MAX_TOKENS      = 500
@@ -96,6 +105,16 @@ type LMResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+}
+
+func (b *Bot) handleQREvent(evt interface{}) {
+	b.qrMux.Lock()
+	defer b.qrMux.Unlock()
+
+	if qrEvt, ok := evt.(*events.QR); ok {
+		qrCode, _ := qrcode.New(qrEvt.Codes[0], qrcode.Medium)
+		fmt.Printf("\n\x1b[36m╔══════════════════════════════════╗\n║          SCAN QR CODE          ║\n╚══════════════════════════════════╝\n\x1b[0m\n%s\n\x1b[36mScan this QR code with your WhatsApp mobile app\x1b[0m\n\n", qrCode.ToSmallString(false))
+	}
 }
 
 func (b *Bot) handleMessage(evt interface{}) {

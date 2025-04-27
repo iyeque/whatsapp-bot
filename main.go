@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -35,7 +36,7 @@ func main() {
 	}
 	defer logFile.Close()
 
-	logger := waLog.Stdout("Bot", "DEBUG", true)
+	logger := waLog.Stdout("Bot", "INFO", true)
 	fmt.Println("Logger initialized...")
 
 	accountManager, err := whatsapp.NewAccountManager(DB_PATH, logger)
