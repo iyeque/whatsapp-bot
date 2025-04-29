@@ -192,6 +192,47 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	}
 	utils.IncrementCacheMiss()
 
+	// Add message to batch queue
+	b.mutex.Lock()
+	if _, exists := b.conversations[chatID]; !exists {
+		b.conversations[chatID] = &Conversation{
+			Messages: make([]BotMessage, 0),
+		}
+	}
+	b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, BotMessage{
+		Role:    "user",
+		Content: userMsg,
+		Time:    time.Now(),
+	})
+	b.mutex.Unlock()
+
+	// Process batch after short delay
+	time.AfterFunc(500*time.Millisecond, func() {
+		b.processBatch(chatID)
+	})
+}
+
+func (b *Bot) processBatch(chatID string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	conv, exists := b.conversations[chatID]
+	if !exists || len(conv.Messages) == 0 {
+		return
+	}
+
+	// Get all unprocessed messages
+	var messages []BotMessage
+	for _, msg := range conv.Messages {
+		if msg.Role == "user" {
+			messages = append(messages, msg)
+		}
+	}
+
+	if len(messages) == 0 {
+		return
+	}
+
 	timeout := b.timeouts.getOptimalTimeout()
 	var response string
 	var tokens int
@@ -204,10 +245,15 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 			if timeout > MAX_TIMEOUT {
 				timeout = MAX_TIMEOUT
 			}
-			b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
+			jid, err := types.ParseJID(chatID)
+if err != nil {
+	fmt.Printf("Error parsing JID: %v\n", err)
+	return
+}
+b.sendAcknowledgment(jid, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
 		}
 
-		response, tokens, latency, err = b.makeAIRequest(userMsg, chatID, timeout)
+		response, tokens, latency, err = b.makeAIRequest(messages[len(messages)-1].Content, chatID, timeout)
 		if err == nil {
 			utils.RecordTimeout(true)
 			utils.RecordLMStudioMetrics(latency, tokens)
@@ -221,28 +267,41 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 			if isTimeoutError(err) {
 				errorMsg = "The response is still taking too long. Please try a shorter message."
 			}
-			b.sendAcknowledgment(msg.Info.Chat, errorMsg)
+			jid, err := types.ParseJID(chatID)
+if err != nil {
+	fmt.Printf("Error parsing JID: %v\n", err)
+	return
+}
+b.sendAcknowledgment(jid, errorMsg)
 			return
 		}
 	}
 
-	b.cacheResponse(userMsg, response)
-	b.mutex.Lock()
+	b.cacheResponse(messages[len(messages)-1].Content, response)
 	b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, BotMessage{
 		Role:    "assistant",
 		Content: response,
 		Time:    time.Now(),
 	})
-	b.mutex.Unlock()
 
 	replyMsg := utils.CreateTextMessage(response)
-	if _, err := b.client.SendMessage(context.Background(), msg.Info.Chat, replyMsg); err != nil {
+	jid, err := types.ParseJID(chatID)
+	if err != nil {
+		fmt.Printf("Error parsing JID: %v\n", err)
+		return
+	}
+	if _, err := b.client.SendMessage(context.Background(), jid, replyMsg); err != nil {
 		fmt.Printf("Error sending message: %v\n", err)
 		return
 	}
 
 	go func() {
-		if err := b.client.MarkRead([]string{msg.Info.ID}, time.Now(), msg.Info.Chat, msg.Info.Sender); err != nil {
+		jid, err := types.ParseJID(chatID)
+		if err != nil {
+			fmt.Printf("Error parsing JID: %v\n", err)
+			return
+		}
+		if err := b.client.MarkRead([]string{messages[len(messages)-1].Content}, time.Now(), jid, jid); err != nil {
 			fmt.Printf("Error marking message as read: %v\n", err)
 		}
 	}()
