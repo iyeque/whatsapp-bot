@@ -1,15 +1,15 @@
-
 package whatsapp
 
 import (
 	"context"
 	"encoding/json"
-	"github.com/skip2/go-qrcode"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/skip2/go-qrcode"
 
 	"whatsapp-gpt-bot/utils"
 
@@ -81,11 +81,6 @@ func (b *Bot) Disconnect() {
 // IsConnected returns whether the client is connected
 func (b *Bot) IsConnected() bool {
 	return b.client.IsConnected()
-}
-
-func (b *Bot) decodeAndSaveQR(qr string) {
-	qrCode, _ := qrcode.New(qr, qrcode.Medium)
-	fmt.Printf("\n\x1b[36m╔══════════════════════════════════╗\n║          SCAN QR CODE          ║\n╚══════════════════════════════════╝\n\x1b[0m\n%s\n\x1b[36mScan this QR code with your WhatsApp mobile app\x1b[0m\n\n", qrCode.ToSmallString(false))
 }
 
 const (
@@ -246,11 +241,11 @@ func (b *Bot) processBatch(chatID string) {
 				timeout = MAX_TIMEOUT
 			}
 			jid, err := types.ParseJID(chatID)
-if err != nil {
-	fmt.Printf("Error parsing JID: %v\n", err)
-	return
-}
-b.sendAcknowledgment(jid, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
+			if err != nil {
+				fmt.Printf("Error parsing JID: %v\n", err)
+				return
+			}
+			b.sendAcknowledgment(jid, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
 		}
 
 		response, tokens, latency, err = b.makeAIRequest(messages[len(messages)-1].Content, chatID, timeout)
@@ -268,11 +263,11 @@ b.sendAcknowledgment(jid, fmt.Sprintf("Retrying with longer timeout (%ds)...", i
 				errorMsg = "The response is still taking too long. Please try a shorter message."
 			}
 			jid, err := types.ParseJID(chatID)
-if err != nil {
-	fmt.Printf("Error parsing JID: %v\n", err)
-	return
-}
-b.sendAcknowledgment(jid, errorMsg)
+			if err != nil {
+				fmt.Printf("Error parsing JID: %v\n", err)
+				return
+			}
+			b.sendAcknowledgment(jid, errorMsg)
 			return
 		}
 	}
