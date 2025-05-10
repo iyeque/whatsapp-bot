@@ -4,6 +4,7 @@ package whatsapp
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cenkalti/backoff/v4"
 )
@@ -24,12 +25,18 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	// Try to restore session without timeout
 	if c.storage != nil {
-		if session, err := c.storage.Load(); err == nil {
+		session, err := c.storage.Load()
+		if err == nil {
 			c.session = session
-			if err := c.handler.RestoreSession(session.Data); err == nil {
+			if err := c.handler.RestoreSession(session.Data.([]byte)); err == nil {
 				c.state = StateConnected
 				return nil
 			}
+			// Update session state and error
+			session.State = StateDisconnected
+			session.LastError = err
+			session.LastActive = time.Now()
+			_ = c.storage.Save(session)
 		}
 	}
 

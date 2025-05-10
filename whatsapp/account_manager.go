@@ -1,15 +1,14 @@
 
+
 package whatsapp
 
 import (
 	"fmt"
 	"sync"
-	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"golang.org/x/time/rate"
 )
 
 // AccountManager handles multiple WhatsApp bot instances
@@ -18,18 +17,6 @@ type AccountManager struct {
 	bots      map[string]*Bot
 	logger    waLog.Logger
 	mutex     sync.RWMutex
-	
-	// Rate limiting and priority management
-	priorityQueues map[string]chan *BotRequest
-	rateLimiters  map[string]*rate.Limiter
-}
-
-// BotRequest represents a request to the bot
-type BotRequest struct {
-	Message   string
-	ChatID    string
-	Priority  int
-	Timestamp time.Time
 }
 
 // NewAccountManager creates a new account manager
@@ -40,11 +27,9 @@ func NewAccountManager(dbPath string, logger waLog.Logger) (*AccountManager, err
 	}
 
 	return &AccountManager{
-		container:      container,
-		bots:           make(map[string]*Bot),
-		logger:         logger,
-		priorityQueues: make(map[string]chan *BotRequest),
-		rateLimiters:   make(map[string]*rate.Limiter),
+		container: container,
+		bots:      make(map[string]*Bot),
+		logger:    logger,
 	}, nil
 }
 

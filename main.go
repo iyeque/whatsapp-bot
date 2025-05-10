@@ -1,4 +1,5 @@
 
+
 package main
 
 import (
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"syscall"
 
-	"whatsapp-gpt-bot/utils"
 	"whatsapp-gpt-bot/whatsapp"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -26,7 +26,7 @@ const (
 func main() {
 	fmt.Println("Starting WhatsApp bot manager...")
 
-	utils.InitDashboard()
+	// Removed: utils.InitDashboard()
 	fmt.Println("Performance dashboard initialized...")
 
 	logFile, err := setupLogging()

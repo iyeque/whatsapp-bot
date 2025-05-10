@@ -2,32 +2,54 @@ package utils
 
 import (
 	"time"
+	"errors"
 
-	"github.com/cenkalti/backoff/v4"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"google.golang.org/protobuf/proto"
 )
 
-// RetryConfig holds configuration for retry operations
+func CreateTextMessage(text string) *waProto.Message {
+	return &waProto.Message{
+		Conversation: proto.String(text),
+	}
+}
+
 type RetryConfig struct {
+	MaxAttempts     int
 	InitialInterval time.Duration
 	MaxInterval     time.Duration
 	MaxElapsedTime  time.Duration
 }
 
-// DefaultRetryConfig returns a default retry configuration
-func DefaultRetryConfig() *RetryConfig {
-	return &RetryConfig{
-		InitialInterval: 100 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		MaxElapsedTime:  10 * time.Second,
+func WithRetry(f func() error, config *RetryConfig) error {
+	var lastErr error
+	startTime := time.Now()
+
+	for attempt := 0; attempt < config.MaxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff(attempt, *config))
+		}
+
+		if config.MaxElapsedTime > 0 && time.Since(startTime) > config.MaxElapsedTime {
+			if lastErr != nil {
+				return lastErr
+			}
+			return errors.New("retry timeout exceeded")
+		}
+
+		if err := f(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
 	}
+	return lastErr
 }
 
-// WithRetry executes an operation with retry logic using exponential backoff
-func WithRetry(operation func() error, config *RetryConfig) error {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = config.InitialInterval
-	b.MaxInterval = config.MaxInterval
-	b.MaxElapsedTime = config.MaxElapsedTime
-
-	return backoff.Retry(operation, b)
+func backoff(attempt int, config RetryConfig) time.Duration {
+	interval := config.InitialInterval * time.Duration(1<<uint(attempt))
+	if interval > config.MaxInterval {
+		interval = config.MaxInterval
+	}
+	return interval
 }

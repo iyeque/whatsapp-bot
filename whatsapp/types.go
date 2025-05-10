@@ -1,20 +1,24 @@
 package whatsapp
 
-type ConnectionState int
+import (
+	"time"
+)
+
+type ConnectionState string
 
 const (
-	StateDisconnected ConnectionState = iota
-	StateConnecting
-	StateConnected
-	StateReconnecting
+	StateConnecting   ConnectionState = "connecting"
+	StateConnected    ConnectionState = "connected"
+	StateDisconnected ConnectionState = "disconnected"
+	StateReconnecting ConnectionState = "reconnecting"
 )
 
 type SessionData struct {
-	Data []byte
-}
-
-func NewSessionData(data []byte) *SessionData {
-	return &SessionData{
-		Data: data,
-	}
+	ID         string
+	JID        string
+	Created    time.Time
+	LastActive time.Time
+	State      ConnectionState
+	LastError  error
+	Data       interface{}
 }

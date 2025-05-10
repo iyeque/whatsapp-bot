@@ -1,3 +1,4 @@
+
 package ai
 
 import (
@@ -31,7 +32,8 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 
 func (c *Client) Chat(ctx context.Context, prompt string) (string, error) {
 	var resp openai.ChatCompletionResponse
-	config := &utils.RetryConfig{
+	config := utils.RetryConfig{
+		MaxAttempts:     c.retries,
 		InitialInterval: 100 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
 		MaxElapsedTime:  c.timeout,
@@ -54,7 +56,7 @@ func (c *Client) Chat(ctx context.Context, prompt string) (string, error) {
 		}
 		resp = result
 		return nil
-	}, config)
+	}, &config)
 
 	if err != nil {
 		return "", err

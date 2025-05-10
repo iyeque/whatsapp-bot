@@ -1,15 +1,15 @@
+
 package whatsapp
 
 import (
 	"context"
 	"encoding/json"
+	"github.com/skip2/go-qrcode"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/skip2/go-qrcode"
 
 	"whatsapp-gpt-bot/utils"
 
@@ -81,6 +81,11 @@ func (b *Bot) Disconnect() {
 // IsConnected returns whether the client is connected
 func (b *Bot) IsConnected() bool {
 	return b.client.IsConnected()
+}
+
+func (b *Bot) decodeAndSaveQR(qr string) {
+	qrCode, _ := qrcode.New(qr, qrcode.Medium)
+	fmt.Printf("\n\x1b[36m╔══════════════════════════════════╗\n║          SCAN QR CODE          ║\n╚══════════════════════════════════╝\n\x1b[0m\n%s\n\x1b[36mScan this QR code with your WhatsApp mobile app\x1b[0m\n\n", qrCode.ToSmallString(false))
 }
 
 const (
@@ -187,47 +192,6 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	}
 	utils.IncrementCacheMiss()
 
-	// Add message to batch queue
-	b.mutex.Lock()
-	if _, exists := b.conversations[chatID]; !exists {
-		b.conversations[chatID] = &Conversation{
-			Messages: make([]BotMessage, 0),
-		}
-	}
-	b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, BotMessage{
-		Role:    "user",
-		Content: userMsg,
-		Time:    time.Now(),
-	})
-	b.mutex.Unlock()
-
-	// Process batch after short delay
-	time.AfterFunc(500*time.Millisecond, func() {
-		b.processBatch(chatID)
-	})
-}
-
-func (b *Bot) processBatch(chatID string) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-
-	conv, exists := b.conversations[chatID]
-	if !exists || len(conv.Messages) == 0 {
-		return
-	}
-
-	// Get all unprocessed messages
-	var messages []BotMessage
-	for _, msg := range conv.Messages {
-		if msg.Role == "user" {
-			messages = append(messages, msg)
-		}
-	}
-
-	if len(messages) == 0 {
-		return
-	}
-
 	timeout := b.timeouts.getOptimalTimeout()
 	var response string
 	var tokens int
@@ -240,15 +204,10 @@ func (b *Bot) processBatch(chatID string) {
 			if timeout > MAX_TIMEOUT {
 				timeout = MAX_TIMEOUT
 			}
-			jid, err := types.ParseJID(chatID)
-			if err != nil {
-				fmt.Printf("Error parsing JID: %v\n", err)
-				return
-			}
-			b.sendAcknowledgment(jid, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
+			b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("Retrying with longer timeout (%ds)...", int(timeout.Seconds())))
 		}
 
-		response, tokens, latency, err = b.makeAIRequest(messages[len(messages)-1].Content, chatID, timeout)
+		response, tokens, latency, err = b.makeAIRequest(userMsg, chatID, timeout)
 		if err == nil {
 			utils.RecordTimeout(true)
 			utils.RecordLMStudioMetrics(latency, tokens)
@@ -262,41 +221,28 @@ func (b *Bot) processBatch(chatID string) {
 			if isTimeoutError(err) {
 				errorMsg = "The response is still taking too long. Please try a shorter message."
 			}
-			jid, err := types.ParseJID(chatID)
-			if err != nil {
-				fmt.Printf("Error parsing JID: %v\n", err)
-				return
-			}
-			b.sendAcknowledgment(jid, errorMsg)
+			b.sendAcknowledgment(msg.Info.Chat, errorMsg)
 			return
 		}
 	}
 
-	b.cacheResponse(messages[len(messages)-1].Content, response)
+	b.cacheResponse(userMsg, response)
+	b.mutex.Lock()
 	b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, BotMessage{
 		Role:    "assistant",
 		Content: response,
 		Time:    time.Now(),
 	})
+	b.mutex.Unlock()
 
 	replyMsg := utils.CreateTextMessage(response)
-	jid, err := types.ParseJID(chatID)
-	if err != nil {
-		fmt.Printf("Error parsing JID: %v\n", err)
-		return
-	}
-	if _, err := b.client.SendMessage(context.Background(), jid, replyMsg); err != nil {
+	if _, err := b.client.SendMessage(context.Background(), msg.Info.Chat, replyMsg); err != nil {
 		fmt.Printf("Error sending message: %v\n", err)
 		return
 	}
 
 	go func() {
-		jid, err := types.ParseJID(chatID)
-		if err != nil {
-			fmt.Printf("Error parsing JID: %v\n", err)
-			return
-		}
-		if err := b.client.MarkRead([]string{messages[len(messages)-1].Content}, time.Now(), jid, jid); err != nil {
+		if err := b.client.MarkRead([]string{msg.Info.ID}, time.Now(), msg.Info.Chat, msg.Info.Sender); err != nil {
 			fmt.Printf("Error marking message as read: %v\n", err)
 		}
 	}()
