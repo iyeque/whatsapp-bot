@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"whatsapp-gpt-bot/dashboard"
 	"whatsapp-gpt-bot/whatsapp"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -26,7 +27,11 @@ const (
 func main() {
 	fmt.Println("Starting WhatsApp bot manager...")
 
-	// Removed: utils.InitDashboard()
+	// Initialize and start the metrics dashboard
+	if err := dashboard.Start(); err != nil {
+		fmt.Printf("Failed to start metrics dashboard: %v\n", err)
+		return
+	}
 	fmt.Println("Performance dashboard initialized...")
 
 	logFile, err := setupLogging()
@@ -45,6 +50,10 @@ func main() {
 		return
 	}
 	defer accountManager.Close()
+
+	if err := accountManager.LoadBots(); err != nil {
+		logger.Errorf("Failed to load existing bots: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

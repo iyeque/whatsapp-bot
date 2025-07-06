@@ -37,10 +37,10 @@ func NewAccountManager(dbPath string, logger waLog.Logger) (*AccountManager, err
 func (am *AccountManager) CreateNewBot() (*Bot, error) {
 	deviceStore := am.container.NewDevice()
 	client := whatsmeow.NewClient(deviceStore, am.logger)
-	bot := NewBot(client, am.container)
 
 	am.mutex.Lock()
 	botID := fmt.Sprintf("bot_%d", len(am.bots)+1)
+	bot := NewBot(client, am.container, am, botID)
 	am.bots[botID] = bot
 	am.mutex.Unlock()
 
@@ -101,4 +101,30 @@ func (am *AccountManager) RemoveBot(botID string) error {
 func (am *AccountManager) Close() error {
 	am.DisconnectAll()
 	return am.container.Close()
+}
+
+// LoadBots loads existing bot instances from the database
+func (am *AccountManager) LoadBots() error {
+	devices, err := am.container.GetAllDevices()
+	if err != nil {
+		return fmt.Errorf("failed to get devices: %v", err)
+	}
+
+	for _, device := range devices {
+		client := whatsmeow.NewClient(device, am.logger)
+
+		am.mutex.Lock()
+		botID := fmt.Sprintf("bot_%d", len(am.bots)+1)
+		bot := NewBot(client, am.container, am, botID)
+		am.bots[botID] = bot
+		am.mutex.Unlock()
+
+		go func(b *Bot) {
+			if err := b.Connect(); err != nil {
+				am.logger.Errorf("Failed to connect bot: %v", err)
+			}
+		}(bot)
+	}
+
+	return nil
 }

@@ -8,17 +8,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func CreateTextMessage(text string) *waProto.Message {
-	return &waProto.Message{
-		Conversation: proto.String(text),
-	}
-}
-
 type RetryConfig struct {
 	MaxAttempts     int
 	InitialInterval time.Duration
 	MaxInterval     time.Duration
 	MaxElapsedTime  time.Duration
+}
+
+func CreateTextMessage(text string) *waProto.Message {
+	return &waProto.Message{
+		Conversation: proto.String(text),
+	}
 }
 
 func WithRetry(f func() error, config *RetryConfig) error {

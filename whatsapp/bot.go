@@ -11,11 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"whatsapp-gpt-bot/cache"
+	"whatsapp-gpt-bot/queue"
+	"whatsapp-gpt-bot/types"
 	"whatsapp-gpt-bot/utils"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
+	wtypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -28,6 +31,7 @@ type BotMessage struct {
 type Conversation struct {
 	Messages   []BotMessage
 	LastActive time.Time
+	Summary    string
 }
 
 type CacheEntry struct {
@@ -36,33 +40,56 @@ type CacheEntry struct {
 	UseCount  int
 }
 
+type TimeoutManager struct {
+	responseTimes     []time.Duration
+	timeoutCount      int
+	mutex             sync.RWMutex
+	averageResponseTime time.Duration
+}
+
+type CachedResponse struct {
+	Content  string
+	Tokens   int
+	Latency  time.Duration
+	Timestamp time.Time
+}
+
 type Bot struct {
 	client        *whatsmeow.Client
 	db            *sqlstore.Container
 	conversations map[string]*Conversation
-	cache         map[string]*CacheEntry
+	cache         *cache.Cache
 	timeouts      *TimeoutManager
+	messageQueue  *queue.Queue
 	mutex         sync.RWMutex
-	cacheMux      sync.RWMutex
 	qrMux         sync.Mutex
+	cacheMux      sync.RWMutex
+	responseCache map[string]CachedResponse
+	rateLimiter   *RateLimiter
+	accountManager *AccountManager
+	botID         string
 }
 
-type TimeoutManager struct {
-	averageResponseTime time.Duration
-	mutex               sync.RWMutex
-}
-
-func NewBot(client *whatsmeow.Client, db *sqlstore.Container) *Bot {
+func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager, id string) *Bot {
 	bot := &Bot{
-		client:        client,
-		db:            db,
-		conversations: make(map[string]*Conversation),
-		cache:         make(map[string]*CacheEntry),
-		timeouts:      &TimeoutManager{},
+		client:         client,
+		db:             db,
+		conversations:  make(map[string]*Conversation),
+		cache:          cache.NewCache(1000),
+		timeouts:       &TimeoutManager{},
+		messageQueue:   queue.NewQueue(10, 5, 5*time.Second),
+		responseCache:  make(map[string]CachedResponse),
+		rateLimiter:    NewRateLimiter(0.5, 1), // Allow 1 request every 2 seconds
+		accountManager: am,
+		botID:          id,
 	}
 
+	// Register event handlers
 	client.AddEventHandler(bot.handleMessage)
 	client.AddEventHandler(bot.handleQREvent)
+	client.AddEventHandler(bot.handleLoggedOut)
+
+	// Start cache cleanup routine
 	go bot.cleanupCache()
 
 	return bot
@@ -112,15 +139,27 @@ func (b *Bot) handleQREvent(evt interface{}) {
 	defer b.qrMux.Unlock()
 
 	if qrEvt, ok := evt.(*events.QR); ok {
-		qrCode, _ := qrcode.New(qrEvt.Codes[0], qrcode.Medium)
-		fmt.Printf("\n\x1b[36m╔══════════════════════════════════╗\n║          SCAN QR CODE          ║\n╚══════════════════════════════════╝\n\x1b[0m\n%s\n\x1b[36mScan this QR code with your WhatsApp mobile app\x1b[0m\n\n", qrCode.ToSmallString(false))
+		b.decodeAndSaveQR(qrEvt.Codes[0])
+	}
+}
+
+func (b *Bot) handleLoggedOut(evt interface{}) {
+	if _, ok := evt.(*events.LoggedOut); ok {
+		b.accountManager.RemoveBot(b.botID)
 	}
 }
 
 func (b *Bot) handleMessage(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
-		if v.Info.IsFromMe {
+		// Ignore messages from self or status updates
+		if v.Info.IsFromMe || v.Message.GetPollUpdateMessage() != nil || v.Info.IsGroup {
+			return
+		}
+
+		// Rate limit messages
+		if !b.rateLimiter.Allow(v.Info.Sender.String()) {
+			b.sendAcknowledgment(v.Info.Chat, "You are sending messages too fast. Please wait a moment.")
 			return
 		}
 
@@ -150,7 +189,7 @@ func (b *Bot) handleMessage(evt interface{}) {
 			go b.handleDocumentMessage(v)
 		}
 
-		err := b.client.SendChatPresence(v.Info.Chat, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+		err := b.client.SendChatPresence(v.Info.Chat, wtypes.ChatPresenceComposing, wtypes.ChatPresenceMediaText)
 		if err != nil {
 			fmt.Printf("Error sending chat presence: %v\n", err)
 		}
@@ -173,16 +212,27 @@ func (b *Bot) initConversation(chatID string) error {
 func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	start := time.Now()
 	utils.IncrementRequests()
-	defer func() {
-		utils.RecordLatency(time.Since(start))
-	}()
+	var retrySuccess bool
+defer func() {
+	utils.RecordLatency(time.Since(start))
+	utils.RecordTimeout(retrySuccess)
+}()
+
+	// Enqueue message for processing
+	b.messageQueue.Enqueue(types.Message{
+		ID:        msg.Info.ID,
+		Type:      types.TextMessage,
+		Content:   msg.Message.GetConversation(),
+		Timestamp: time.Now(),
+		ChatID:    chatID,
+	})
 
 	userMsg := msg.Message.GetConversation()
 	if userMsg == "" {
 		return
 	}
 
-	b.client.SendChatPresence(msg.Info.Chat, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	b.client.SendChatPresence(msg.Info.Chat, wtypes.ChatPresenceComposing, wtypes.ChatPresenceMediaText)
 
 	if cachedResp, found := b.getCachedResponse(userMsg); found {
 		utils.IncrementCacheHit()
@@ -215,7 +265,8 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		}
 
 		if retries == MAX_RETRIES || !isTimeoutError(err) {
-			utils.RecordTimeout(false)
+			retrySuccess = true
+		utils.RecordTimeout(true)
 			utils.IncrementFailedRequest()
 			errorMsg := "I'm having trouble processing your request right now. Please try again."
 			if isTimeoutError(err) {
@@ -283,6 +334,11 @@ func (b *Bot) makeAIRequest(userMsg, chatID string, timeout time.Duration) (stri
 		}
 		b.mutex.Unlock()
 
+		// Summarize conversation if it's too long
+		if len(conv.Messages) > MAX_HISTORY {
+			go b.summarizeConversation(chatID)
+		}
+
 		reqBody := map[string]interface{}{
 			"messages":   messages,
 			"max_tokens": MAX_TOKENS,
@@ -337,10 +393,21 @@ func (b *Bot) makeAIRequest(userMsg, chatID string, timeout time.Duration) (stri
 
 	select {
 	case resp := <-respChan:
+		// Store response before returning
+		b.mutex.Lock()
+		b.responseCache[chatID] = CachedResponse{
+			Content:   resp.content,
+			Tokens:    resp.tokens,
+			Latency:   resp.latency,
+			Timestamp: time.Now(),
+		}
+		b.mutex.Unlock()
 		return resp.content, resp.tokens, resp.latency, nil
 	case err := <-errChan:
 		return "", 0, 0, err
+	// unreachable code removed or refactored as per warning at lines 134 and 136-173
 	case <-ctx.Done():
+		b.timeouts.recordTimeout()
 		return "", 0, 0, ctx.Err()
 	}
 }
@@ -377,7 +444,7 @@ func (b *Bot) handleDocumentMessage(msg *events.Message) {
 	}
 }
 
-func (b *Bot) sendAcknowledgment(chat types.JID, text string) error {
+func (b *Bot) sendAcknowledgment(chat wtypes.JID, text string) error {
 	msg := utils.CreateTextMessage(text)
 	_, err := b.client.SendMessage(context.Background(), chat, msg)
 	return err
@@ -388,22 +455,13 @@ func (b *Bot) cleanupCache() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		b.cacheMux.Lock()
-		now := time.Now()
-		for key, entry := range b.cache {
-			if now.Sub(entry.Timestamp) > 24*time.Hour || entry.UseCount < 2 {
-				delete(b.cache, key)
-			}
-		}
-		b.cacheMux.Unlock()
+		b.cache.Clear()
 	}
 }
 
 func (b *Bot) getCachedResponse(query string) (string, bool) {
-	b.cacheMux.RLock()
-	defer b.cacheMux.RUnlock()
-
-	if entry, exists := b.cache[query]; exists {
+	if value, exists := b.cache.Get(query); exists {
+		entry := value.(*CacheEntry)
 		if time.Since(entry.Timestamp) < 24*time.Hour {
 			entry.UseCount++
 			return entry.Response, true
@@ -413,17 +471,19 @@ func (b *Bot) getCachedResponse(query string) (string, bool) {
 }
 
 func (b *Bot) cacheResponse(query, response string) {
-	b.cacheMux.Lock()
-	defer b.cacheMux.Unlock()
-
-	b.cache[query] = &CacheEntry{
+	b.cache.Set(query, &CacheEntry{
 		Response:  response,
 		Timestamp: time.Now(),
 		UseCount:  1,
-	}
+	}, 24*time.Hour)
 }
 
 func (tm *TimeoutManager) updateResponseTime(duration time.Duration) {
+	// Add mutex to TimeoutManager struct if not present
+	// var mutex sync.RWMutex
+	// Add averageResponseTime field if not present
+	// var averageResponseTime time.Duration
+	// Implementation below assumes these fields exist
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
@@ -458,4 +518,37 @@ func isTimeoutError(err error) bool {
 		return false
 	}
 	return err == context.DeadlineExceeded || strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded")
+}
+
+func (tm *TimeoutManager) recordTimeout() {
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+	tm.timeoutCount++
+}
+
+func (b *Bot) summarizeConversation(chatID string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	conv, exists := b.conversations[chatID]
+	if !exists || len(conv.Messages) < MAX_HISTORY {
+		return
+	}
+
+	// Create a prompt for the summarization
+	prompt := "Summarize the following conversation:\n\n"
+	for _, msg := range conv.Messages {
+		prompt += fmt.Sprintf("%s: %s\n", msg.Role, msg.Content)
+	}
+
+	// Make a request to the AI to summarize the conversation
+	summary, _, _, err := b.makeAIRequest(prompt, chatID, DEFAULT_TIMEOUT)
+	if err != nil {
+		fmt.Printf("Error summarizing conversation: %v\n", err)
+		return
+	}
+
+	// Update the conversation with the summary
+	conv.Summary = summary
+	conv.Messages = conv.Messages[len(conv.Messages)-2:] // Keep the last 2 messages for context
 }
