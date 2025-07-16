@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	wtypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 type BotMessage struct {
@@ -119,7 +120,7 @@ const (
 	LM_STUDIO_URL   = "http://localhost:1234/v1/chat/completions"
 	MAX_TOKENS      = 500
 	MAX_HISTORY     = 10
-	DEFAULT_TIMEOUT = 30 * time.Second
+	DEFAULT_TIMEOUT = 300 * time.Second
 	MIN_TIMEOUT     = 10 * time.Second
 	INITIAL_TIMEOUT = 15 * time.Second
 	MAX_TIMEOUT     = 60 * time.Second
@@ -160,7 +161,6 @@ func (b *Bot) handleMessage(evt interface{}) {
 		// Get the bot's own JID. It might be nil if we're not connected yet.
 		botJID := b.client.Store.ID
 		if botJID == nil {
-			// Not connected yet, drop the message.
 			return
 		}
 
@@ -202,13 +202,17 @@ func (b *Bot) handleMessage(evt interface{}) {
 			go b.handleImageMessage(v)
 		case v.Message.GetDocumentMessage() != nil:
 			go b.handleDocumentMessage(v)
+		case v.Message.GetTemplateButtonReplyMessage() != nil:
+			// Handle template button replies
+			v.Message.Conversation = proto.String(v.Message.GetTemplateButtonReplyMessage().GetSelectedID())
+			go b.handleTextMessage(v, chatID)
 		}
 
 		err := b.client.SendChatPresence(v.Info.Chat, wtypes.ChatPresenceComposing, wtypes.ChatPresenceMediaText)
 		if err != nil {
-			fmt.Printf("Error sending chat presence: %v\n", err)
-		}
-	}
+            fmt.Printf("Error sending chat presence: %v\n", err)
+        }
+    }
 }
 
 func (b *Bot) initConversation(chatID string) error {
