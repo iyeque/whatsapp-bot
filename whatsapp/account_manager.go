@@ -3,6 +3,7 @@
 package whatsapp
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -21,7 +22,7 @@ type AccountManager struct {
 
 // NewAccountManager creates a new account manager
 func NewAccountManager(dbPath string, logger waLog.Logger) (*AccountManager, error) {
-	container, err := sqlstore.New("sqlite", dbPath, logger)
+	container, err := sqlstore.New(context.Background(), "sqlite", dbPath, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %v", err)
 	}
@@ -105,7 +106,7 @@ func (am *AccountManager) Close() error {
 
 // LoadBots loads existing bot instances from the database
 func (am *AccountManager) LoadBots() error {
-	devices, err := am.container.GetAllDevices()
+	devices, err := am.container.GetAllDevices(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to get devices: %v", err)
 	}

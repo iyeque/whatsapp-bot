@@ -515,7 +515,7 @@ func (b *Bot) makeIndependentAIRequest(prompt string, timeout time.Duration) (st
 func (b *Bot) handleImageMessage(msg *events.Message) {
 	img := msg.Message.GetImageMessage()
 	if img != nil {
-		data, err := b.client.Download(img)
+		data, err := b.client.Download(context.Background(), img)
 		if err != nil {
 			fmt.Printf("Error downloading image: %v\n", err)
 			return
@@ -531,7 +531,7 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 func (b *Bot) handleDocumentMessage(msg *events.Message) {
 	doc := msg.Message.GetDocumentMessage()
 	if doc != nil {
-		data, err := b.client.Download(doc)
+		data, err := b.client.Download(context.Background(), doc)
 		if err != nil {
 			fmt.Printf("Error downloading document: %v\n", err)
 			return
