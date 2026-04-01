@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp GPT Bot Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold mb-8">WhatsApp GPT Bot Dashboard</h1>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <!-- General Metrics -->
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">General Metrics</h2>
+                <div id="generalMetrics" class="space-y-2"></div>
+            </div>
+
+            <!-- LM Studio Metrics -->
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">LM Studio Performance</h2>
+                <div id="lmStudioMetrics" class="space-y-2"></div>
+            </div>
+
+            <!-- Memory Stats -->
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">Memory Usage</h2>
+                <div id="memoryStats" class="space-y-2"></div>
+            </div>
+
+            <!-- Timeout Metrics -->
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">Timeout Statistics</h2>
+                <div id="timeoutMetrics" class="space-y-2"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function updateMetrics() {
+    fetch('/dashboard-metrics')
+        .then(response => response.json())
+        .then(data => {
+            // Update General Metrics
+            const generalMetricsHtml = Object.entries(data.general || {}).map(([key, value]) =>
+                `<div class="flex justify-between">
+                    <span class="text-gray-600">${key}:</span>
+                    <span class="font-medium">${value}</span>
+                </div>`
+            ).join('');
+            document.getElementById('generalMetrics').innerHTML = generalMetricsHtml;
+
+            // Update LM Studio Metrics
+            const lmStudioHtml = Object.entries(data.lm_studio || {}).map(([key, value]) =>
+                `<div class="flex justify-between">
+                    <span class="text-gray-600">${key}:</span>
+                    <span class="font-medium">${value}</span>
+                </div>`
+            ).join('');
+            document.getElementById('lmStudioMetrics').innerHTML = lmStudioHtml;
+
+            // Update Memory Stats
+            const memoryHtml = Object.entries(data.memory || {}).map(([key, value]) =>
+                `<div class="flex justify-between">
+                    <span class="text-gray-600">${key}:</span>
+                    <span class="font-medium">${typeof value === 'number' ? formatBytes(value) : value}</span>
+                </div>`
+            ).join('');
+            document.getElementById('memoryStats').innerHTML = memoryHtml;
+
+            // Update Timeout Metrics
+            const timeoutHtml = Object.entries(data.timeouts || {}).map(([key, value]) =>
+                `<div class="flex justify-between">
+                    <span class="text-gray-600">${key}:</span>
+                    <span class="font-medium">${value}</span>
+                </div>`
+            ).join('');
+            document.getElementById('timeoutMetrics').innerHTML = timeoutHtml;
+        })
+        .catch(error => console.error('Error fetching metrics:', error));
+}
+
+// Update metrics every 5 seconds
+setInterval(updateMetrics, 5000);
+// Initial update
+updateMetrics();
+    </script>
+</body>
+</html>

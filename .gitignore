@@ -1,0 +1,25 @@
+# Binary
+whatsapp-gpt-bot
+whatsapp-gpt-bot.exe
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Environment files
+.env
+
+# Log files
+logs/
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
