@@ -792,7 +792,7 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		if isFamily && userName == "Wilma" {
 			roleInstruction += " You are talking to your wife, Wilma. Be affectionate and natural, but remember you are also her digital assistant ('maximus') helping her with tasks like tests or information. Stay focused on her current requests and do NOT hallucinate unrelated personal details (like dinner plans) unless she brings them up."
 		} else if isFamily && (userName == "Stephanie" || userName == "Nicki") {
-			roleInstruction += fmt.Sprintf(" You are talking to your sister, %s. Be natural as a brother would be.", userName)
+			roleInstruction += fmt.Sprintf(" You are talking to your sister, %s. Be natural as a brother would be. Stay chill and do NOT make up stories or plans.", userName)
 		}
 	}
 
@@ -825,6 +825,8 @@ The search results will be provided to you immediately. Use this to be the most 
 
 ### IMPORTANT:
 - **BE EXTREMELY CONCISE.** Avoid long paragraphs. 1-3 sentences is the sweet spot.
+- **BE CHILL.** If someone says "hi", "hey", or something similar, respond simply with "hey, how's it going?" or "what's up?". Do NOT over-explain or add unnecessary context to simple greetings.
+- **DO NOT HALLUCINATE.** Do NOT make up stories about where you are (e.g., "just got back into town"), what you are doing, or your current plans unless they are explicitly in the Recent History. If you don't know, don't mention it.
 - **DO NOT THINK OUT LOUD.** Do not include bracketed comments about your logic (e.g., "(If Wilma answers...)"). Only output the actual response.
 - DO NOT summarize your personality or identity.
 - DO NOT mention personality tests, Enneagrams, or MBTI types UNLESS the user is currently taking one or asks about it.
