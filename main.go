@@ -16,6 +16,8 @@ import (
 	"whatsapp-gpt-bot/whatsapp"
 
 	"github.com/joho/godotenv"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 	_ "modernc.org/sqlite"
@@ -35,13 +37,6 @@ func main() {
 
 	fmt.Println("Starting WhatsApp bot manager...")
 
-	// Initialize and start the metrics dashboard
-	if err := dashboard.Start(); err != nil {
-		fmt.Printf("Failed to start metrics dashboard: %v\n", err)
-		return
-	}
-	fmt.Println("Performance dashboard initialized...")
-
 	logFile, err := setupLogging()
 	if err != nil {
 		fmt.Printf("Failed to set up logging: %v\n", err)
@@ -49,8 +44,13 @@ func main() {
 	}
 	defer logFile.Close()
 
+	// Initialize zerolog to write to both console and file
+	multi := zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}, logFile)
+	log.Logger = zerolog.New(multi).With().Timestamp().Logger()
+	zerolog.TimeFieldFormat = time.RFC3339
+
 	logger := waLog.Stdout("Bot", "INFO", false)
-	fmt.Println("Logger initialized...")
+	fmt.Println("Loggers initialized (Console + whatsapp-bot.log)...")
 
 	// Start external services (Whisper, TTS) if configured
 	startExternalServices(logger)
@@ -61,6 +61,13 @@ func main() {
 		return
 	}
 	defer accountManager.Close()
+
+	// Initialize and start the Nerve Center dashboard
+	if err := dashboard.Start(accountManager); err != nil {
+		logger.Errorf("Failed to start Nerve Center dashboard: %v", err)
+	} else {
+		fmt.Println("Nerve Center dashboard initialized...")
+	}
 
 	if err := accountManager.LoadBots(); err != nil {
 		logger.Errorf("Failed to load existing bots: %v", err)

@@ -3,96 +3,231 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WhatsApp GPT Bot Dashboard</title>
+    <title>Maximus Nerve Center</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        .active-tab { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+        #log-viewer { font-family: 'Courier New', Courier, monospace; background-color: #1a1a1a; color: #00ff00; }
+    </style>
 </head>
-<body class="bg-gray-100">
-    <div class="container mx-auto px-4 py-8">
-        <h1 class="text-3xl font-bold mb-8">WhatsApp GPT Bot Dashboard</h1>
-        
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            <!-- General Metrics -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h2 class="text-xl font-semibold mb-4">General Metrics</h2>
-                <div id="generalMetrics" class="space-y-2"></div>
+<body class="bg-gray-100 font-sans">
+    <div class="flex flex-col h-screen">
+        <!-- Header -->
+        <header class="bg-white shadow-sm p-4 flex justify-between items-center">
+            <h1 class="text-2xl font-bold text-gray-800"><i class="fas fa-brain mr-2"></i>Maximus Nerve Center</h1>
+            <div class="flex items-center space-x-4">
+                <input type="password" id="api-key" placeholder="API Key" class="border rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" value="">
+                <button onclick="saveApiKey()" class="bg-blue-500 text-white px-3 py-1 rounded text-sm hover:bg-blue-600 transition">Save</button>
+            </div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="bg-white border-b flex space-x-8 px-8">
+            <button onclick="showTab('metrics')" id="tab-metrics" class="py-4 font-medium transition active-tab">Metrics</button>
+            <button onclick="showTab('tasks')" id="tab-tasks" class="py-4 font-medium transition">Tasks</button>
+            <button onclick="showTab('logs')" id="tab-logs" class="py-4 font-medium transition text-gray-500">System Logs</button>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="flex-grow overflow-y-auto p-8">
+            <!-- Metrics Tab -->
+            <div id="content-metrics" class="space-y-8">
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h2 class="text-gray-500 text-sm font-semibold uppercase mb-2">Total Requests</h2>
+                        <p id="stat-requests" class="text-3xl font-bold text-gray-800">-</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h2 class="text-gray-500 text-sm font-semibold uppercase mb-2">Active Sessions</h2>
+                        <p id="stat-sessions" class="text-3xl font-bold text-blue-600">-</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h2 class="text-gray-500 text-sm font-semibold uppercase mb-2">Avg Latency</h2>
+                        <p id="stat-latency" class="text-3xl font-bold text-yellow-600">-</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h2 class="text-gray-500 text-sm font-semibold uppercase mb-2">Heap Usage</h2>
+                        <p id="stat-memory" class="text-3xl font-bold text-green-600">-</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h3 class="font-bold text-lg mb-4 border-b pb-2">LM Studio Intelligence</h3>
+                        <div id="lm-metrics" class="space-y-3"></div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm">
+                        <h3 class="font-bold text-lg mb-4 border-b pb-2">System Health</h3>
+                        <div id="health-metrics" class="space-y-3"></div>
+                    </div>
+                </div>
             </div>
 
-            <!-- LM Studio Metrics -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h2 class="text-xl font-semibold mb-4">LM Studio Performance</h2>
-                <div id="lmStudioMetrics" class="space-y-2"></div>
+            <!-- Tasks Tab -->
+            <div id="content-tasks" class="hidden space-y-6">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-xl font-bold text-gray-800">Scheduled Tasks</h2>
+                    <button onclick="resumeAutopilot()" class="bg-green-500 text-white px-4 py-2 rounded shadow hover:bg-green-600 transition">
+                        <i class="fas fa-play mr-2"></i>Global Resume & Refresh
+                    </button>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Schedule</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Target JID</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Instruction</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="task-list" class="bg-white divide-y divide-gray-200"></tbody>
+                    </table>
+                </div>
             </div>
 
-            <!-- Memory Stats -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h2 class="text-xl font-semibold mb-4">Memory Usage</h2>
-                <div id="memoryStats" class="space-y-2"></div>
+            <!-- Logs Tab -->
+            <div id="content-logs" class="hidden flex flex-col h-full">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">System Logs</h2>
+                    <button onclick="refreshLogs()" class="text-blue-500 hover:text-blue-700"><i class="fas fa-sync"></i> Refresh</button>
+                </div>
+                <div id="log-viewer" class="flex-grow p-4 rounded-lg overflow-y-auto text-xs leading-relaxed whitespace-pre">Loading logs...</div>
             </div>
-
-            <!-- Timeout Metrics -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h2 class="text-xl font-semibold mb-4">Timeout Statistics</h2>
-                <div id="timeoutMetrics" class="space-y-2"></div>
-            </div>
-        </div>
+        </main>
     </div>
 
     <script>
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
+        let currentTab = 'metrics';
+        
+        // Initial setup
+        document.getElementById('api-key').value = localStorage.getItem('maximus_api_key') || '';
 
-function updateMetrics() {
-    fetch('/dashboard-metrics')
-        .then(response => response.json())
-        .then(data => {
-            // Update General Metrics
-            const generalMetricsHtml = Object.entries(data.general || {}).map(([key, value]) =>
-                `<div class="flex justify-between">
-                    <span class="text-gray-600">${key}:</span>
-                    <span class="font-medium">${value}</span>
-                </div>`
-            ).join('');
-            document.getElementById('generalMetrics').innerHTML = generalMetricsHtml;
+        function saveApiKey() {
+            localStorage.setItem('maximus_api_key', document.getElementById('api-key').value);
+            alert('API Key saved locally');
+            location.reload();
+        }
 
-            // Update LM Studio Metrics
-            const lmStudioHtml = Object.entries(data.lm_studio || {}).map(([key, value]) =>
-                `<div class="flex justify-between">
-                    <span class="text-gray-600">${key}:</span>
-                    <span class="font-medium">${value}</span>
-                </div>`
-            ).join('');
-            document.getElementById('lmStudioMetrics').innerHTML = lmStudioHtml;
+        function getHeaders() {
+            const key = localStorage.getItem('maximus_api_key');
+            return key ? { 'X-API-Key': key } : {};
+        }
 
-            // Update Memory Stats
-            const memoryHtml = Object.entries(data.memory || {}).map(([key, value]) =>
-                `<div class="flex justify-between">
-                    <span class="text-gray-600">${key}:</span>
-                    <span class="font-medium">${typeof value === 'number' ? formatBytes(value) : value}</span>
-                </div>`
-            ).join('');
-            document.getElementById('memoryStats').innerHTML = memoryHtml;
+        function showTab(tab) {
+            document.getElementById('content-' + currentTab).classList.add('hidden');
+            document.getElementById('tab-' + currentTab).classList.remove('active-tab', 'text-blue-600');
+            document.getElementById('tab-' + currentTab).classList.add('text-gray-500');
 
-            // Update Timeout Metrics
-            const timeoutHtml = Object.entries(data.timeouts || {}).map(([key, value]) =>
-                `<div class="flex justify-between">
-                    <span class="text-gray-600">${key}:</span>
-                    <span class="font-medium">${value}</span>
-                </div>`
-            ).join('');
-            document.getElementById('timeoutMetrics').innerHTML = timeoutHtml;
-        })
-        .catch(error => console.error('Error fetching metrics:', error));
-}
+            currentTab = tab;
+            document.getElementById('content-' + tab).classList.remove('hidden');
+            document.getElementById('tab-' + tab).classList.add('active-tab', 'text-blue-600');
+            document.getElementById('tab-' + tab).classList.remove('text-gray-500');
 
-// Update metrics every 5 seconds
-setInterval(updateMetrics, 5000);
-// Initial update
-updateMetrics();
+            if (tab === 'tasks') refreshTasks();
+            if (tab === 'logs') refreshLogs();
+        }
+
+        function formatBytes(bytes) {
+            if (!bytes) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        async function updateMetrics() {
+            try {
+                const res = await fetch('/dashboard-metrics', { headers: getHeaders() });
+                if (res.status === 401) {
+                    document.getElementById('stat-requests').innerText = 'Unauthorized';
+                    return;
+                }
+                const data = await res.json();
+
+                // Hero Stats
+                document.getElementById('stat-requests').innerText = data.general.TotalRequests || 0;
+                document.getElementById('stat-sessions').innerText = data.general.ActiveSessions || 0;
+                document.getElementById('stat-latency').innerText = (data.general.AverageLatency / 1000000000).toFixed(1) + 's';
+                document.getElementById('stat-memory').innerText = formatBytes(data.memory.HeapAlloc);
+
+                // LM Studio
+                const lmHtml = Object.entries(data.lm_studio || {}).map(([key, val]) => `
+                    <div class="flex justify-between py-1">
+                        <span class="text-gray-500 capitalize">${key.replace(/_/g, ' ')}</span>
+                        <span class="font-medium text-gray-800">${typeof val === 'number' && key.includes('latency') ? val.toFixed(1) + 'ms' : val}</span>
+                    </div>
+                `).join('');
+                document.getElementById('lm-metrics').innerHTML = lmHtml;
+
+                // Health
+                const healthHtml = `
+                    <div class="flex justify-between py-1"><span>Goroutines</span><span class="font-medium">${data.general.GoroutineCount}</span></div>
+                    <div class="flex justify-between py-1"><span>Memory In-Use</span><span class="font-medium">${formatBytes(data.memory.HeapInUse)}</span></div>
+                    <div class="flex justify-between py-1"><span>Heap Objects</span><span class="font-medium">${data.memory.HeapObjects}</span></div>
+                    <div class="flex justify-between py-1"><span>Timeouts Avoided</span><span class="font-medium text-green-600">${data.timeouts.TimeoutsAvoided}</span></div>
+                    <div class="flex justify-between py-1"><span>Timeouts Hit</span><span class="font-medium text-red-600">${data.timeouts.TimeoutCount}</span></div>
+                `;
+                document.getElementById('health-metrics').innerHTML = healthHtml;
+
+            } catch (err) { console.error(err); }
+        }
+
+        async function refreshTasks() {
+            try {
+                const res = await fetch('/api/tasks', { headers: getHeaders() });
+                if (res.status === 401) return;
+                const tasks = await res.json();
+                const list = document.getElementById('task-list');
+                list.innerHTML = tasks.map(t => `
+                    <tr>
+                        <td class="px-6 py-4 text-sm text-gray-900">${t.id}</td>
+                        <td class="px-6 py-4 text-sm text-blue-600 font-mono">${t.cron_expr}</td>
+                        <td class="px-6 py-4 text-sm text-gray-500">${t.target_jid.includes('@') ? t.target_jid.split('@')[0] : t.target_jid}</td>
+                        <td class="px-6 py-4 text-sm text-gray-700">${t.instruction}</td>
+                        <td class="px-6 py-4 text-sm">
+                            <button onclick="deleteTask(${t.id})" class="text-red-600 hover:text-red-900"><i class="fas fa-trash"></i></button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (err) { console.error(err); }
+        }
+
+        async function deleteTask(id) {
+            if (!confirm('Are you sure you want to delete this task?')) return;
+            const res = await fetch('/api/tasks?id=' + id, { method: 'DELETE', headers: getHeaders() });
+            if (res.status === 401) alert('Unauthorized. Check API Key.');
+            refreshTasks();
+        }
+
+        async function resumeAutopilot() {
+            const res = await fetch('/api/bot/resume', { method: 'POST', headers: getHeaders() });
+            if (res.status === 401) alert('Unauthorized. Check API Key.');
+            else alert('Autopilot resumed and tasks refreshed globally.');
+        }
+
+        async function refreshLogs() {
+            try {
+                const res = await fetch('/api/logs', { headers: getHeaders() });
+                if (res.status === 401) {
+                    document.getElementById('log-viewer').innerText = 'Unauthorized - Set API Key';
+                    return;
+                }
+                const logs = await res.text();
+                document.getElementById('log-viewer').innerText = logs;
+                const viewer = document.getElementById('log-viewer');
+                viewer.scrollTop = viewer.scrollHeight;
+            } catch (err) { console.error(err); }
+        }
+
+        setInterval(() => {
+            if (currentTab === 'metrics') updateMetrics();
+            if (currentTab === 'logs') refreshLogs();
+        }, 5000);
+
+        updateMetrics();
     </script>
 </body>
 </html>

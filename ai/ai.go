@@ -7,15 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
-
-func init() {
-	// Initialize structured logging
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-}
 
 // MakeAIRequest is a thin wrapper that selects an AI provider and delegates the request.
 func MakeAIRequest(prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {

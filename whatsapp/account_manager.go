@@ -19,7 +19,7 @@ type AccountManager struct {
 	logger      waLog.Logger
 	mutex       sync.RWMutex
 	vectorStore *VectorStore
-	sqlDB       *sql.DB
+	SqlDB       *sql.DB
 }
 
 // NewAccountManager creates a new account manager
@@ -44,7 +44,7 @@ func NewAccountManager(dbPath string, logger waLog.Logger) (*AccountManager, err
 		bots:        make(map[string]*Bot),
 		logger:      logger,
 		vectorStore: vs,
-		sqlDB:       sqlDB,
+		SqlDB:       sqlDB,
 	}, nil
 }
 

@@ -1,6 +1,6 @@
 module whatsapp-gpt-bot
 
-go 1.24.0
+go 1.24.1
 
 toolchain go1.24.2
 
@@ -20,6 +20,9 @@ require (
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728 // direct
+	github.com/nguyenthenguyen/docx v0.0.0-20230621112118-9c8e795a11db // direct
+	github.com/robfig/cron/v3 v3.0.1 // direct
 	github.com/vektah/gqlparser/v2 v2.5.31 // indirect
 	golang.org/x/text v0.32.0 // indirect
 )

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
+	GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1/models/"
 	OPENAI_API_BASE = "https://api.openai.org/v1/"
 	GROQ_API_BASE   = "https://api.groq.com/openai/v1/"
 )
@@ -507,8 +507,8 @@ func (g *geminiProvider) Generate(ctx context.Context, prompt string, mediaData 
 	}
 
 	// Try latest and stable model names
-	// Order: gemini-2.0-flash (fastest/newest), gemini-1.5-flash, gemini-1.5-flash-002, gemini-1.5-pro
-	candidates := []string{"gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-002", "gemini-1.5-pro", "gemini-1.5-flash-8b"}
+	// Order: gemini-1.5-flash (stable), gemini-1.5-pro (stable), gemini-1.5-flash-8b, gemini-2.0-flash (experimental)
+	candidates := []string{"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-8b", "gemini-2.0-flash"}
 	if custom := os.Getenv("GEMINI_MODEL"); custom != "" {
 		candidates = append([]string{custom}, candidates...)
 	}

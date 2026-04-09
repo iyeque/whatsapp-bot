@@ -1,0 +1,11 @@
+# Core files
+*.exe
+
+.vs/
+*.db
+*.db-shm
+*.db-wal
+
+# Cache files
+*.embedding.json
+cache/

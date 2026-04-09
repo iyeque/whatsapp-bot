@@ -1,15 +1,23 @@
 package whatsapp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ledongthuc/pdf"
+	"github.com/nguyenthenguyen/docx"
+	"github.com/robfig/cron/v3"
 	"github.com/skip2/go-qrcode"
 
 	"whatsapp-gpt-bot/ai"
@@ -64,7 +72,7 @@ type CachedResponse struct {
 type Bot struct {
 	client            *whatsmeow.Client
 	db                *sqlstore.Container
-	sqlDB             *sql.DB
+	SqlDB             *sql.DB
 	conversations     map[string]*Conversation
 	cache             *cache.Cache
 	timeouts          *TimeoutManager
@@ -80,13 +88,15 @@ type Bot struct {
 	ackCooldown       time.Duration
 	ignoredChatJIDs   map[string]bool      // JIDs of chats to ignore
 	mutedUntil        map[string]time.Time // Chats where Max took the wheel
+	consecutiveFailures map[string]int      // Track consecutive AI failures per chat
+	cron              *cron.Cron           // Scheduler for automated tasks
 }
 
 func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager, id string) (*Bot, error) {
 	bot := &Bot{
 		client:          client,
 		db:              db,
-		sqlDB:           am.sqlDB,
+		SqlDB:           am.SqlDB,
 		conversations:   make(map[string]*Conversation),
 		cache:           cache.NewCache(1000),
 		timeouts:        &TimeoutManager{},
@@ -99,7 +109,10 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 		ackCooldown:     60 * time.Second,
 		ignoredChatJIDs: make(map[string]bool),
 		mutedUntil:      make(map[string]time.Time),
+		consecutiveFailures: make(map[string]int),
+		cron:            cron.New(),
 	}
+	bot.cron.Start()
 
 	// Parse IGNORED_CHAT_JIDS environment variable
 	if ignoredJIDsStr := os.Getenv("IGNORED_CHAT_JIDS"); ignoredJIDsStr != "" {
@@ -120,6 +133,10 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 
 	if err := bot.loadConversationsFromDB(); err != nil {
 		return nil, fmt.Errorf("failed to load conversations from DB: %w", err)
+	}
+
+	if err := bot.loadScheduledTasks(); err != nil {
+		log.Error().Err(err).Msg("Failed to load scheduled tasks")
 	}
 
 	// Register event handlers
@@ -221,12 +238,79 @@ func (b *Bot) handleLoggedOut(evt interface{}) {
 }
 
 func (b *Bot) handleMessage(evt interface{}) {
+	log.Info().Msgf("TRACE: Event received: %+v", evt)
 	switch v := evt.(type) {
 	case *events.Message:
+		// Extract text immediately (handling edits)
+		msgText := v.Message.GetConversation()
+		if msgText == "" && v.Message.GetExtendedTextMessage() != nil {
+			msgText = v.Message.GetExtendedTextMessage().GetText()
+		}
+		// Handle edited messages
+		if msgText == "" && v.Message.GetProtocolMessage() != nil && v.Message.GetProtocolMessage().GetEditedMessage() != nil {
+			edited := v.Message.GetProtocolMessage().GetEditedMessage()
+			if edited.GetExtendedTextMessage() != nil {
+				msgText = edited.GetExtendedTextMessage().GetText()
+			} else {
+				msgText = edited.GetConversation()
+			}
+		}
+		msgText = strings.TrimSpace(msgText)
+		lowerMsg := strings.ToLower(msgText)
+
+		// Priority Command Handling
+		if strings.HasPrefix(lowerMsg, "!") {
+			baseHumanJID := strings.Split(b.humanAssistantJID, "@")[0]
+			isFromMe := v.Info.MessageSource.IsFromMe
+			isMax := isFromMe || strings.Contains(v.Info.Sender.String(), baseHumanJID) || strings.Contains(v.Info.Chat.String(), baseHumanJID)
+			switch {
+			case lowerMsg == "!tasks":
+				b.listScheduledTasks(v.Info.Chat)
+				return
+			case lowerMsg == "!status":
+				b.handleStatusCommand(v.Info.Chat)
+				return
+			case lowerMsg == "!logs":
+				b.handleLogsCommand(v.Info.Chat)
+				return
+			case lowerMsg == "!resume" || lowerMsg == "!autopilot":
+				if isMax {
+					b.ResumeAutopilot()
+					b.sendAcknowledgment(v.Info.Chat, "✅ Auto-pilot re-engaged and failure counters cleared.")
+				}
+				return
+			case strings.HasPrefix(lowerMsg, "!fact"):
+				if isMax {
+					fact := strings.TrimSpace(strings.TrimPrefix(msgText, "!fact"))
+					if fact != "" {
+						b.handleFactCommand(v.Info.Chat, fact)
+					}
+				}
+				return
+			case strings.HasPrefix(lowerMsg, "!correct"):
+				correction := strings.TrimSpace(strings.TrimPrefix(msgText, "!correct"))
+				if correction != "" {
+					b.handleCorrectCommand(v.Info.Chat, correction)
+				}
+				return
+			case strings.HasPrefix(lowerMsg, "!schedule"):
+				b.handleScheduleCommand(v.Info.Chat, msgText)
+				return
+			case strings.HasPrefix(lowerMsg, "!unschedule") || strings.HasPrefix(lowerMsg, "!remove schedule"):
+				b.handleUnscheduleCommand(v.Info.Chat, msgText)
+				return
+			}
+		}
+
+		chatID := v.Info.Chat.String()
 		// Check if this chat should be ignored
 		if _, ok := b.ignoredChatJIDs[v.Info.Chat.String()]; ok {
-			log.Debug().Msgf("Ignoring message from chat %v as it is in the ignored list.", v.Info.Chat)
-			return
+			isCmd := strings.HasPrefix(strings.TrimSpace(msgText), "!")
+			if !isCmd {
+				log.Debug().Msgf("Ignoring non-command message from chat %v as it is in the ignored list.", v.Info.Chat)
+				return
+			}
+			log.Debug().Msgf("Processing command from ignored chat %v.", v.Info.Chat)
 		}
 
 		// Ignore messages from self or status updates
@@ -240,11 +324,12 @@ func (b *Bot) handleMessage(evt interface{}) {
 			return
 		}
 
-		chatID := v.Info.Chat.String()
+		chatID = v.Info.Chat.String()
 		isFromMe := v.Info.MessageSource.IsFromMe
 
 		// Detect if Max (the account owner) is sending a message (including from this bot or other devices)
-		if isFromMe {
+		// We only ignore 'isFromMe' messages if they are NOT priority commands.
+		if isFromMe && !strings.HasPrefix(lowerMsg, "!") {
 			userMsg := v.Message.GetConversation()
 			if userMsg == "" && v.Message.GetExtendedTextMessage() != nil {
 				userMsg = v.Message.GetExtendedTextMessage().GetText()
@@ -269,12 +354,17 @@ func (b *Bot) handleMessage(evt interface{}) {
 
 			// Check for manual resume command from Max (e.g., "engage autopilot", "resume", or "!resume")
 			cmd := strings.TrimSpace(strings.ToLower(userMsg))
-			if cmd == "engage autopilot" || cmd == "resume" || cmd == "!resume" {
-				b.mutex.Lock()
-				delete(b.mutedUntil, chatID)
-				b.mutex.Unlock()
+			if cmd == "engage autopilot" || cmd == "resume" || cmd == "!resume" || cmd == "!autopilot" {
+				b.ResumeAutopilot()
 				log.Debug().Msgf("Auto-pilot resumed in chat %s by Max.", chatID)
-				b.sendAcknowledgment(v.Info.Chat, "✅ Auto-pilot re-engaged.")
+				b.sendAcknowledgment(v.Info.Chat, "✅ Auto-pilot re-engaged and schedules refreshed globally.")
+			}
+
+			// Autonomous Reflection Trigger:
+			// Run every 50 messages from Max to keep personality in sync.
+			if len(b.conversations[chatID].Messages)%50 == 0 {
+				log.Info().Msg("Triggering autonomous Soul reflection.")
+				go b.Reflect()
 			}
 			return // Never respond to our own messages
 		}
@@ -445,7 +535,7 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 	var summary sql.NullString
 	var lastActive time.Time
 	var lastMessageTimestamp time.Time
-	row := b.sqlDB.QueryRow("SELECT summary, last_active, last_message_timestamp FROM conversations WHERE chat_id = ?", chatID)
+	row := b.SqlDB.QueryRow("SELECT summary, last_active, last_message_timestamp FROM conversations WHERE chat_id = ?", chatID)
 	if err := row.Scan(&summary, &lastActive, &lastMessageTimestamp); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil // Not found
@@ -460,7 +550,7 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 		LastMessageTimestamp: lastMessageTimestamp,
 	}
 
-	msgRows, err := b.sqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
+	msgRows, err := b.SqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages for chat %s: %w", chatID, err)
 	}
@@ -697,7 +787,7 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 				}
 
 				// Save personality profile to DB
-				_, err := b.sqlDB.Exec("INSERT INTO user_personalities (user_id, profile, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET profile = ?, updated_at = ?",
+				_, err := b.SqlDB.Exec("INSERT INTO user_personalities (user_id, profile, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET profile = ?, updated_at = ?",
 					userID, result, time.Now(), result, time.Now())
 				if err != nil {
 					fmt.Printf("Error saving personality to DB: %v\n", err)
@@ -731,8 +821,12 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	if err != nil {
 		fmt.Printf("Error retrieving context: %v\n", err)
 	}
+	// SAFETY CAP: Limit RAG context to 6,000 characters
+	if len(retrievedCtx) > 6000 {
+		retrievedCtx = retrievedCtx[:6000] + "... [truncated]"
+	}
 
-	var recentHistoryBuilder strings.Builder
+	var historyMessages []string
 	var archivedHistoryBuilder strings.Builder
 	b.mutex.RLock()
 	convForPrompt, _ := b.conversations[chatID]
@@ -764,10 +858,16 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 			archivedHistoryBuilder.WriteString(formattedMsg)
 			hasArchived = true
 		} else {
-			recentHistoryBuilder.WriteString(formattedMsg)
+			historyMessages = append(historyMessages, formattedMsg)
 		}
 	}
 	b.mutex.RUnlock()
+
+	// SAFETY CAP: Limit archived history to 4,000 characters
+	archivedHistoryStr := archivedHistoryBuilder.String()
+	if len(archivedHistoryStr) > 4000 {
+		archivedHistoryStr = archivedHistoryStr[len(archivedHistoryStr)-4000:]
+	}
 
 	var roleInstruction string
 	var botPersona string
@@ -775,11 +875,15 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	// Get persona texts to include in system prompt
 	identityDoc := ""
 	personalityDoc := ""
+	truthDoc := ""
 	if doc, ok := b.vectorStore.documents["identity.md"]; ok {
 		identityDoc = doc.Text
 	}
 	if doc, ok := b.vectorStore.documents["personality.md"]; ok {
 		personalityDoc = doc.Text
+	}
+	if data, err := os.ReadFile("truth.md"); err == nil {
+		truthDoc = string(data)
 	}
 
 	if isMax {
@@ -787,7 +891,7 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		roleInstruction = "You are 'maximus', Max's digital assistant. Be helpful, concise, and professional. Max is your creator and the user you are helping."
 	} else {
 		// When talking to others, the persona is Max's personality
-		botPersona = personalityDoc
+		botPersona = personalityDoc + "\n\n### TRUTH JOURNAL (PRIORITY FACTS):\n" + truthDoc
 		roleInstruction = fmt.Sprintf("You are responding ON BEHALF of Max to %s. You ARE Max's digital twin. You must speak as if you ARE Max. Use 'I', 'me', 'my' to refer to yourself as Max. Do NOT mention you are an AI or an assistant (unless you are at the very beginning of the relationship or specifically asked). Be natural, warm, and concise.", userName)
 		if isFamily && userName == "Wilma" {
 			roleInstruction += " You are talking to your wife, Wilma. Be affectionate and natural, but remember you are also her digital assistant ('maximus') helping her with tasks like tests or information. Stay focused on her current requests and do NOT hallucinate unrelated personal details (like dinner plans) unless she brings them up."
@@ -799,7 +903,21 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	// Build the archived context section
 	archivedSection := ""
 	if hasArchived {
-		archivedSection = fmt.Sprintf("\n### PRIOR CONVERSATION CONTEXT (FYI ONLY):\n%s\n*IMPORTANT: This context is from prior days/conversations. You are AWARE of it, but you MUST NOT mention it, refer to it, or bring up old topics from it unless %s explicitly asks about them. Start the current interaction fresh based only on the Recent History.*\n", archivedHistoryBuilder.String(), userName)
+		archivedSection = fmt.Sprintf("\n### PRIOR CONVERSATION CONTEXT (FYI ONLY):\n%s\n*IMPORTANT: This context is from prior days/conversations. You are AWARE of it, but you MUST NOT mention it, refer to it, or bring up old topics from it unless %s explicitly asks about them. Start the current interaction fresh based only on the Recent History.*\n", archivedHistoryStr, userName)
+	}
+
+	// SAFETY CAP: Build recent history string, trimming oldest messages if it exceeds 10,000 chars
+	recentHistoryStr := ""
+	for i := 0; i < len(historyMessages); i++ {
+		tempHistory := strings.Join(historyMessages[i:], "")
+		if len(tempHistory) <= 10000 {
+			recentHistoryStr = tempHistory
+			break
+		}
+		// If even the last message is too long, truncate it
+		if i == len(historyMessages)-1 && len(tempHistory) > 10000 {
+			recentHistoryStr = tempHistory[:10000] + "... [truncated]"
+		}
 	}
 
 	systemPrompt := fmt.Sprintf(`### ROLE:
@@ -852,7 +970,7 @@ The user sent this message at %s. Use this as the current moment to determine 't
 
 ### RECENT HISTORY:
 %s
-`, roleInstruction, botPersona, userName, msg.Info.Timestamp.Format("Monday, January 2, 2006 at 3:04 PM"), retrievedCtx, archivedSection, recentHistoryBuilder.String())
+`, roleInstruction, botPersona, userName, msg.Info.Timestamp.Format("Monday, January 2, 2006 at 3:04 PM"), retrievedCtx, archivedSection, recentHistoryStr)
 
 	augmentedPrompt := fmt.Sprintf("%s\n\n%s: %s\nMax:", systemPrompt, userName, userMsg)
 	if isMax {
@@ -865,6 +983,17 @@ The user sent this message at %s. Use this as the current moment to determine 't
 	if err != nil {
 		log.Error().Err(err).Msg("Error making AI request")
 		utils.IncrementFailedRequest()
+
+		// HITL: Increment failure count
+		b.mutex.Lock()
+		b.consecutiveFailures[chatID]++
+		failCount := b.consecutiveFailures[chatID]
+		b.mutex.Unlock()
+
+		if failCount >= 3 {
+			b.triggerHITLAlert(chatID, err)
+		}
+
 		errorMsg := "I'm having trouble processing your request right now. Please try again."
 		if isTimeoutError(err) {
 			errorMsg = "The response is still taking too long. Please try a shorter message."
@@ -874,6 +1003,40 @@ The user sent this message at %s. Use this as the current moment to determine 't
 		// Throttle error acknowledgments so we don't spam the chat repeatedly
 		b.sendAcknowledgmentThrottled(msg.Info.Chat, errorMsg)
 		return
+	}
+
+	// HITL: Reset failure count on success
+	b.mutex.Lock()
+	b.consecutiveFailures[chatID] = 0
+	b.mutex.Unlock()
+
+	// 1. PERFORM SEARCH LOOP IF NEEDED
+	for i := 0; i < 2; i++ { // Allow up to 2 search rounds
+		if !strings.Contains(response, "[SEARCH:") {
+			break
+		}
+
+		startIdx := strings.Index(response, "[SEARCH:")
+		endIdx := strings.Index(response[startIdx:], "]")
+		if endIdx == -1 {
+			break
+		}
+
+		searchQuery := response[startIdx+8 : startIdx+endIdx]
+		log.Info().Msgf("AI requested web search: %s", searchQuery)
+
+		searchResults, err := utils.SearchWeb(searchQuery)
+		if err != nil {
+			log.Warn().Err(err).Msgf("Search failed for: %s", searchQuery)
+			searchResults = "Search failed: " + err.Error()
+		}
+
+		// Re-prompt the AI with the results
+		augmentedPrompt += fmt.Sprintf("\n\n### SEARCH RESULTS FOR \"%s\":\n%s\n\n(Based on these results, please provide your final response to the user as Max.)", searchQuery, searchResults)
+		response, tokens, latency, err = ai.MakeAIRequest(augmentedPrompt, nil, "", timeout)
+		if err != nil {
+			break
+		}
 	}
 
 	b.cacheResponse(userMsg, response)
@@ -1048,11 +1211,40 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 	prompt += "Please describe what you see in this image and respond to the user appropriately as Max."
 
 	timeout := b.timeouts.getOptimalTimeout()
-	response, tokens, latency, err := ai.MakeAIRequest(prompt, data, "image/jpeg", timeout)
+	
+	// Calculate hash for caching
+	h := sha256.New()
+	h.Write(data)
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	// Check cache
+	var description string
+	err = b.SqlDB.QueryRow("SELECT description FROM image_cache WHERE image_hash = ?", hash).Scan(&description)
+	
+	var response string
+	var tokens int
+	var latency time.Duration
+
 	if err != nil {
-		log.Error().Err(err).Msg("Error processing image with AI")
-		b.sendAcknowledgment(msg.Info.Chat, "✅ Image received, but I'm having trouble seeing it right now.")
-		return
+		// Cache miss: describe it with AI
+		log.Info().Msg("New image, describing with AI.")
+		
+		response, tokens, latency, err = ai.MakeAIRequest(prompt, data, "image/jpeg", timeout)
+		if err != nil {
+			log.Error().Err(err).Msg("Error describing image with AI")
+			b.sendAcknowledgment(msg.Info.Chat, "✅ Image received, but I'm having trouble seeing it right now.")
+			return
+		}
+		// Save to cache
+		_, err = b.SqlDB.Exec("INSERT INTO image_cache (image_hash, description, created_at) VALUES (?, ?, ?)", hash, response, time.Now())
+		if err != nil {
+			log.Error().Err(err).Msg("Error saving image to cache")
+		}
+	} else {
+		log.Info().Msg("Image found in visual memory cache.")
+		response = description
+		tokens = 0
+		latency = 0
 	}
 
 	// Save to history
@@ -1094,10 +1286,23 @@ func (b *Bot) handleDocumentMessage(msg *events.Message) {
 	switch {
 	case strings.HasSuffix(strings.ToLower(fileName), ".txt") || strings.HasSuffix(strings.ToLower(fileName), ".md") || strings.Contains(mimeType, "text/plain"):
 		extractedText = string(data)
+	case strings.HasSuffix(strings.ToLower(fileName), ".pdf") || strings.Contains(mimeType, "pdf"):
+		extractedText, err = extractTextFromPDF(data)
+		if err != nil {
+			log.Error().Err(err).Msg("Error extracting text from PDF")
+			b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("❌ Error reading PDF: %s", fileName))
+			return
+		}
+	case strings.HasSuffix(strings.ToLower(fileName), ".docx") || strings.Contains(mimeType, "officedocument.wordprocessingml.document"):
+		extractedText, err = extractTextFromDocx(data)
+		if err != nil {
+			log.Error().Err(err).Msg("Error extracting text from DOCX")
+			b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("❌ Error reading Word document: %s", fileName))
+			return
+		}
 	default:
 		// For now, acknowledge other files.
-		// (We can add PDF/DOCX parsing here later if the environment allows libraries)
-		b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("✅ Received document: %s. I can currently only read the contents of .txt and .md files.", fileName))
+		b.sendAcknowledgment(msg.Info.Chat, fmt.Sprintf("✅ Received document: %s. I can currently read .txt, .md, .pdf, and .docx files.", fileName))
 		return
 	}
 
@@ -1288,7 +1493,7 @@ func (b *Bot) summarizeConversation(chatID string) {
 		}
 
 		// Delete older messages from DB
-		_, err = b.sqlDB.Exec("DELETE FROM messages WHERE conversation_chat_id = ? AND timestamp NOT IN (SELECT timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp DESC LIMIT 5)", chatID, chatID)
+		_, err = b.SqlDB.Exec("DELETE FROM messages WHERE conversation_chat_id = ? AND timestamp NOT IN (SELECT timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp DESC LIMIT 5)", chatID, chatID)
 		if err != nil {
 			fmt.Printf("Error deleting old messages from DB: %v\n", err)
 		}
@@ -1324,19 +1529,49 @@ func (b *Bot) initDBSchema() error {
 	);
 	`
 
-	_, err := b.sqlDB.Exec(createConversationsTableSQL)
+	createScheduledTasksTableSQL := `
+	CREATE TABLE IF NOT EXISTS scheduled_tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chat_id TEXT NOT NULL,
+		target_jid TEXT NOT NULL,
+		cron_expr TEXT NOT NULL,
+		instruction TEXT NOT NULL,
+		is_dynamic BOOLEAN DEFAULT 0,
+		created_at DATETIME NOT NULL
+	);
+	`
+
+	createImageCacheTableSQL := `
+	CREATE TABLE IF NOT EXISTS image_cache (
+		image_hash TEXT PRIMARY KEY,
+		description TEXT NOT NULL,
+		created_at DATETIME NOT NULL
+	);
+	`
+
+	_, err := b.SqlDB.Exec(createConversationsTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create conversations table: %w", err)
 	}
 
-	_, err = b.sqlDB.Exec(createMessagesTableSQL)
+	_, err = b.SqlDB.Exec(createMessagesTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create messages table: %w", err)
 	}
 
-	_, err = b.sqlDB.Exec(createUserPersonalitiesTableSQL)
+	_, err = b.SqlDB.Exec(createUserPersonalitiesTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create user_personalities table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createScheduledTasksTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create scheduled_tasks table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createImageCacheTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create image_cache table: %w", err)
 	}
 
 	return nil
@@ -1349,7 +1584,7 @@ func (b *Bot) GetID() string {
 
 func (b *Bot) loadConversationsFromDB() error {
 	// Load user personalities first
-	pRows, err := b.sqlDB.Query("SELECT user_id, profile FROM user_personalities")
+	pRows, err := b.SqlDB.Query("SELECT user_id, profile FROM user_personalities")
 	if err == nil {
 		defer pRows.Close()
 		for pRows.Next() {
@@ -1360,7 +1595,7 @@ func (b *Bot) loadConversationsFromDB() error {
 		}
 	}
 
-	rows, err := b.sqlDB.Query("SELECT chat_id, summary, last_active, last_message_timestamp FROM conversations")
+	rows, err := b.SqlDB.Query("SELECT chat_id, summary, last_active, last_message_timestamp FROM conversations")
 	if err != nil {
 		return fmt.Errorf("failed to query conversations: %w", err)
 	}
@@ -1385,7 +1620,7 @@ func (b *Bot) loadConversationsFromDB() error {
 
 		// Load messages for this conversation
 		if err := func() error {
-			msgRows, err := b.sqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
+			msgRows, err := b.SqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
 			if err != nil {
 				return fmt.Errorf("failed to query messages for chat %s: %w", chatID, err)
 			}
@@ -1416,7 +1651,7 @@ func (b *Bot) loadConversationsFromDB() error {
 }
 
 func (b *Bot) saveConversationToDB(chatID string, conv *Conversation) error {
-	_, err := b.sqlDB.Exec(
+	_, err := b.SqlDB.Exec(
 		"INSERT INTO conversations (chat_id, summary, last_active, last_message_timestamp) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET summary = ?, last_active = ?, last_message_timestamp = ?",
 		chatID, conv.Summary, conv.LastActive, conv.LastMessageTimestamp, conv.Summary, conv.LastActive, conv.LastMessageTimestamp,
 	)
@@ -1427,7 +1662,7 @@ func (b *Bot) saveConversationToDB(chatID string, conv *Conversation) error {
 }
 
 func (b *Bot) saveMessageToDB(chatID string, msg BotMessage) error {
-	_, err := b.sqlDB.Exec(
+	_, err := b.SqlDB.Exec(
 		"INSERT INTO messages (conversation_chat_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
 		chatID, msg.Role, msg.Content, msg.Time,
 	)
@@ -1558,3 +1793,373 @@ func (b *Bot) processAIResponse(chatID string, chat wtypes.JID, msgID string, re
 		}
 	}()
 }
+
+func extractTextFromPDF(data []byte) (string, error) {
+	pdfReader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	for i := 1; i <= pdfReader.NumPage(); i++ {
+		text, err := pdfReader.Page(i).GetPlainText(nil)
+		if err != nil {
+			continue
+		}
+		buf.WriteString(text)
+	}
+	return buf.String(), nil
+}
+
+func extractTextFromDocx(data []byte) (string, error) {
+	docxReader, err := docx.ReadDocxFromMemory(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", err
+	}
+	defer docxReader.Close()
+	return docxReader.Editable().GetContent(), nil
+}
+
+// handleScheduleCommand parses and schedules a task.
+// Format: schedule "cron_expression" message
+// Example: schedule "0 8 * * *" Remind me to take out the trash
+// handleScheduleCommand parses and schedules a task using AI.
+func (b *Bot) handleScheduleCommand(chat wtypes.JID, text string) {
+	// 1. Ask Gemini to parse the request into a JSON structure
+	parsePrompt := fmt.Sprintf(`### INSTRUCTION:
+Parse the user's scheduling request into a JSON object with these fields:
+- "cron_expression": A valid 5-part cron expression (e.g., "0 8 * * *").
+- "target": The name or JID of the person to receive the message.
+- "instruction": A clear instruction for me (Max's AI) to follow when the task runs.
+- "is_dynamic": Boolean. Set to true if I need to GENERATE fresh content (like a poem, news, or weather) when the task runs.
+
+### REFERENCE DATA:
+- Wilma's JID: 97375716663491@s.whatsapp.net
+- Stephanie's JID: 76420520931421@s.whatsapp.net
+- My JID (the requester): %s
+
+### USER REQUEST:
+"%s"
+
+### OUTPUT FORMAT:
+Respond ONLY with the JSON object. Example:
+{"cron_expression": "0 8 * * *", "target": "97375716663491@s.whatsapp.net", "instruction": "Write a romantic poem for Wilma.", "is_dynamic": true}`, chat.String(), text)
+
+	response, _, _, err := ai.MakeAIRequest(parsePrompt, nil, "", DEFAULT_TIMEOUT)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Error parsing schedule request with AI.")
+		return
+	}
+
+	// Simple cleanup of JSON response
+	response = strings.TrimSpace(response)
+	if strings.Contains(response, "```json") {
+		response = strings.Split(strings.Split(response, "```json")[1], "```")[0]
+	} else if strings.Contains(response, "```") {
+		response = strings.Split(strings.Split(response, "```")[1], "```")[0]
+	}
+	response = strings.TrimSpace(response)
+
+	var taskData struct {
+		CronExpression string `json:"cron_expression"`
+		Target         string `json:"target"`
+		Instruction    string `json:"instruction"`
+		IsDynamic      bool   `json:"is_dynamic"`
+	}
+
+	if err := json.Unmarshal([]byte(response), &taskData); err != nil {
+		b.sendAcknowledgment(chat, "❌ AI generated an invalid schedule format: "+response)
+		return
+	}
+
+	targetJID, err := wtypes.ParseJID(taskData.Target)
+	if err != nil {
+		targetJID = chat // Fallback to sender
+	}
+
+	// 2. Schedule the task
+	_, err = b.cron.AddFunc(taskData.CronExpression, func() {
+		b.executeScheduledTask(targetJID, taskData.Instruction, taskData.IsDynamic)
+	})
+
+	if err != nil {
+		b.sendAcknowledgment(chat, fmt.Sprintf("❌ Error scheduling task: %v", err))
+		return
+	}
+
+	// 3. Save to database
+	_, err = b.SqlDB.Exec("INSERT INTO scheduled_tasks (chat_id, target_jid, cron_expr, instruction, is_dynamic, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		chat.String(), targetJID.String(), taskData.CronExpression, taskData.Instruction, taskData.IsDynamic, time.Now())
+	if err != nil {
+		log.Error().Err(err).Msg("Error saving scheduled task to DB")
+	}
+
+	confirmMsg := fmt.Sprintf("✅ *Task Scheduled!*\n- *Target:* %s\n- *Frequency:* %s\n- *Action:* %s", taskData.Target, taskData.CronExpression, taskData.Instruction)
+	b.sendAcknowledgment(chat, confirmMsg)
+}
+
+// executeScheduledTask performs the actual work (AI generation or simple message)
+func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDynamic bool) {
+	var finalContent string
+
+	if isDynamic {
+		// Use AI to generate content (poems, news, weather, etc.)
+		prompt := fmt.Sprintf("You are performing a scheduled task as Max. Your instruction is: \"%s\". Please generate the appropriate content now.", instruction)
+		
+		// If it looks like a news/weather request, hint at searching
+		if strings.Contains(strings.ToLower(instruction), "news") || strings.Contains(strings.ToLower(instruction), "price") || strings.Contains(strings.ToLower(instruction), "weather") {
+			prompt += " You MUST use your [SEARCH:...] tool if you need current information like weather, news, or prices. Once you have the results, provide the final summary."
+		}
+
+		response, _, _, err := ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
+		if err != nil {
+			log.Error().Err(err).Msg("Error generating AI content for scheduled task")
+			finalContent = "⚠️ (Auto-Task Error): " + instruction
+		} else {
+			// PERFORM SEARCH LOOP IF AI REQUESTED IT
+			for i := 0; i < 2; i++ {
+				if !strings.Contains(response, "[SEARCH:") {
+					break
+				}
+				startIdx := strings.Index(response, "[SEARCH:")
+				endIdx := strings.Index(response[startIdx:], "]")
+				if endIdx == -1 {
+					break
+				}
+				searchQuery := response[startIdx+8 : startIdx+endIdx]
+				log.Info().Msgf("Scheduled task AI requested web search: %s", searchQuery)
+
+				searchResults, _ := utils.SearchWeb(searchQuery)
+				prompt += fmt.Sprintf("\n\n### SEARCH RESULTS FOR \"%s\":\n%s\n\n(Based on these results, please provide your final response as Max.)", searchQuery, searchResults)
+				response, _, _, err = ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
+				if err != nil {
+					break
+				}
+			}
+			finalContent = CleanResponse(response)
+		}
+	} else {
+		finalContent = instruction
+	}
+
+	log.Info().Msgf("Executing scheduled task for %s: %s", target.String(), finalContent)
+	b.sendAcknowledgment(target, "⏰ *Scheduled Task:*\n\n"+finalContent)
+}
+
+func (b *Bot) loadScheduledTasks() error {
+	rows, err := b.SqlDB.Query("SELECT target_jid, cron_expr, instruction, is_dynamic FROM scheduled_tasks")
+	if err != nil {
+		return fmt.Errorf("failed to query scheduled tasks: %w", err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var targetStr, cronExpr, instruction string
+		var isDynamic bool
+		if err := rows.Scan(&targetStr, &cronExpr, &instruction, &isDynamic); err != nil {
+			log.Error().Err(err).Msg("Error scanning scheduled task row")
+			continue
+		}
+
+		targetJID, err := wtypes.ParseJID(targetStr)
+		if err != nil {
+			log.Error().Err(err).Msgf("Error parsing target JID from DB: %s", targetStr)
+			continue
+		}
+
+		// Re-schedule the task
+		// Local variables to avoid closure capture issues
+		tJID := targetJID
+		instr := instruction
+		dyn := isDynamic
+
+		_, err = b.cron.AddFunc(cronExpr, func() {
+			b.executeScheduledTask(tJID, instr, dyn)
+		})
+		if err != nil {
+			log.Error().Err(err).Msgf("Error re-scheduling task from DB: %s", cronExpr)
+		} else {
+			count++
+		}
+	}
+	log.Info().Msgf("Restored %d scheduled tasks from database", count)
+	return nil
+}
+
+func (b *Bot) handleUnscheduleCommand(chat wtypes.JID, text string) {
+	parts := strings.Fields(text)
+	// format: remove schedule [id] or unschedule [id]
+	
+	if len(parts) < 3 && strings.HasPrefix(strings.ToLower(text), "remove schedule") {
+		// List tasks if no ID
+		b.listScheduledTasks(chat)
+		return
+	}
+	if len(parts) < 2 && strings.HasPrefix(strings.ToLower(text), "unschedule") {
+		b.listScheduledTasks(chat)
+		return
+	}
+
+	idIdx := 2
+	if strings.HasPrefix(strings.ToLower(text), "unschedule") {
+		idIdx = 1
+	}
+
+	taskID := parts[idIdx]
+	res, err := b.SqlDB.Exec("DELETE FROM scheduled_tasks WHERE id = ?", taskID)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Error removing task: "+err.Error())
+		return
+	}
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		b.sendAcknowledgment(chat, "❌ No task found with ID: "+taskID)
+	} else {
+		b.sendAcknowledgment(chat, "✅ Task "+taskID+" removed. (Note: It will stop running immediately, but internal cron entry remains until next restart. Use '!resume' to fully refresh if critical.)")
+	}
+}
+
+func (b *Bot) listScheduledTasks(chat wtypes.JID) {
+	rows, err := b.SqlDB.Query("SELECT id, cron_expr, instruction, target_jid FROM scheduled_tasks")
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Error listing tasks: "+err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var builder strings.Builder
+	builder.WriteString("📋 *Active Scheduled Tasks:*\n\n")
+	found := false
+	for rows.Next() {
+		var id int
+		var cron, instr, target string
+		if err := rows.Scan(&id, &cron, &instr, &target); err == nil {
+			found = true
+			builder.WriteString(fmt.Sprintf("[%d] %s -> %s (%s)\n", id, cron, target, instr))
+		}
+	}
+
+	if !found {
+		b.sendAcknowledgment(chat, "No active scheduled tasks found.")
+	} else {
+		builder.WriteString("\nTo remove one, use: `remove schedule [ID]`")
+		b.sendAcknowledgment(chat, builder.String())
+	}
+}
+
+// ResumeAutopilot clears all mutes and refreshes scheduled tasks.
+func (b *Bot) ResumeAutopilot() {
+	b.mutex.Lock()
+	b.mutedUntil = make(map[string]time.Time)
+	b.mutex.Unlock()
+
+	b.cron.Stop()
+	b.cron = cron.New()
+	b.cron.Start()
+	b.loadScheduledTasks()
+}
+
+func (b *Bot) handleStatusCommand(chat wtypes.JID) {
+	m := utils.GetMetrics()
+	mem := utils.GetMemoryStats()
+	
+	status := fmt.Sprintf("🤖 *Maximus Status*\n\n" +
+		"📈 *Metrics:*\n" +
+		"- Total Requests: %d\n" +
+		"- Active Sessions: %d\n" +
+		"- Avg Latency: %v\n\n" +
+		"🧠 *Memory:*\n" +
+		"- Heap Alloc: %s\n" +
+		"- Heap In-Use: %s\n" +
+		"- Goroutines: %d",
+		m.TotalRequests, m.ActiveSessions, time.Duration(m.AverageLatency),
+		formatBytes(mem.HeapAlloc), formatBytes(mem.HeapInUse), m.GoroutineCount)
+		
+	b.sendAcknowledgment(chat, status)
+}
+
+func (b *Bot) handleLogsCommand(chat wtypes.JID) {
+	logPath := filepath.Join("logs", "whatsapp-bot.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Could not read logs.")
+		return
+	}
+	
+	lines := strings.Split(string(data), "\n")
+	start := len(lines) - 15
+	if start < 0 { start = 0 }
+	
+	snippet := strings.Join(lines[start:], "\n")
+	b.sendAcknowledgment(chat, "📋 *Recent Logs:*\n\n" + snippet)
+}
+
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func (b *Bot) handleFactCommand(chat wtypes.JID, fact string) {
+	f, err := os.OpenFile("truth.md", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Error saving fact.")
+		return
+	}
+	defer f.Close()
+	
+	if _, err := f.WriteString("- " + fact + "\n"); err != nil {
+		b.sendAcknowledgment(chat, "❌ Error writing fact.")
+		return
+	}
+	b.sendAcknowledgment(chat, "✅ Fact added to truth journal: " + fact)
+}
+
+func (b *Bot) handleCorrectCommand(chat wtypes.JID, correction string) {
+	f, err := os.OpenFile("truth.md", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Error saving correction.")
+		return
+	}
+	defer f.Close()
+	
+	if _, err := f.WriteString("- " + correction + "\n"); err != nil {
+		b.sendAcknowledgment(chat, "❌ Error writing correction.")
+		return
+	}
+	
+	b.sendAcknowledgment(chat, "✅ Correction noted. My apologies for the misinformation—let me clarify: " + correction)
+}
+
+// triggerHITLAlert notifies the human assistant that the bot is stuck and pauses autopilot for that chat.
+func (b *Bot) triggerHITLAlert(chatID string, lastErr error) {
+	alertMsg := fmt.Sprintf("🚨 *MAXIMUS CRITICAL ALERT*\n\n" +
+		"Bot is stuck in chat: %s\n" +
+		"Consecutive Failures: 3\n" +
+		"Last Error: %v\n\n" +
+		"Auto-pilot has been paused for this chat. Please intervene or use '!resume' when ready.",
+		chatID, lastErr)
+	
+	// Send to Max
+	targetJID, err := wtypes.ParseJID(b.humanAssistantJID)
+	if err == nil {
+		b.sendAcknowledgment(targetJID, alertMsg)
+	}
+	
+	// Pause bot for this chat until manual resume
+	b.mutex.Lock()
+	b.mutedUntil[chatID] = time.Now().Add(24 * time.Hour)
+	b.mutex.Unlock()
+	
+	log.Warn().Msgf("HITL Alert triggered for chat %s. Bot paused.", chatID)
+}
+
+

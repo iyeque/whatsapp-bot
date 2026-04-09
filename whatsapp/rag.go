@@ -444,19 +444,33 @@ func (vs *VectorStore) retrieveContext(query string, userID string) (string, err
 
 		for name, doc := range vs.documents {
 			// Skip identity/personality docs as they are provided in system prompt
-			if name == "identity.md" || name == "personality.md" {
+			if name == "identity.md" || name == "personality.md" || name == "soul.md" {
 				continue
 			}
 			if len(doc.Embedding) == 0 {
 				continue
 			}
 			similarity := cosineSimilarity(queryEmbedding, doc.Embedding)
-			if similarity > 0.7 { // Threshold for relevance
+			if similarity > 0.4 { // Lower threshold but we'll sort
 				matches = append(matches, match{doc.Text, similarity})
 			}
 		}
 
-		// Sort or just pick top matches (simple version: just append them)
+		// Sort by similarity descending
+		for i := 0; i < len(matches); i++ {
+			for j := i + 1; j < len(matches); j++ {
+				if matches[j].similarity > matches[i].similarity {
+					matches[i], matches[j] = matches[j], matches[i]
+				}
+			}
+		}
+
+		// Take only Top 3 matches to keep context small
+		maxMatches := 3
+		if len(matches) > maxMatches {
+			matches = matches[:maxMatches]
+		}
+
 		if len(matches) > 0 {
 			relevantContext.WriteString("## Relevant Background Information:\n")
 			for _, m := range matches {
