@@ -577,7 +577,7 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 
 // CleanResponse strips all [REACT], [SEARCH], and [VOICE] tags from a string.
 func CleanResponse(text string) string {
-	// 1. Strip [REACT:...] tags (robust loop)
+	// 1. Strip [REACT:...] tags
 	for {
 		lower := strings.ToLower(text)
 		reactMarker := "[react"
@@ -593,16 +593,19 @@ func CleanResponse(text string) string {
 		text = text[:idx] + text[idx+endIdx+1:]
 	}
 
-	// 2. Strip [SEARCH:...] tags
+	// 2. Strip ALL variants of [SEARCH:...] tags (case-insensitive)
 	for {
-		idx := strings.Index(text, "[SEARCH:")
+		lower := strings.ToLower(text)
+		searchMarker := "[search"
+		idx := strings.Index(lower, searchMarker)
 		if idx == -1 {
 			break
 		}
 		endIdx := strings.Index(text[idx:], "]")
 		if endIdx == -1 {
-			text = text[:idx] + text[idx+len("[SEARCH:"): ]
-			break
+			// Malformed tag, just strip the marker
+			text = text[:idx] + text[idx+len(searchMarker):]
+			continue
 		}
 		text = text[:idx] + text[idx+endIdx+1:]
 	}
@@ -1916,20 +1919,42 @@ func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDyna
 			finalContent = "⚠️ (Auto-Task Error): " + instruction
 		} else {
 			// PERFORM SEARCH LOOP IF AI REQUESTED IT
-			for i := 0; i < 2; i++ {
-				if !strings.Contains(response, "[SEARCH:") {
+			for i := 0; i < 3; i++ { // Increased to 3 turns for complex queries
+				lowerResp := strings.ToLower(response)
+				searchIdx := strings.Index(lowerResp, "[search")
+				if searchIdx == -1 {
 					break
 				}
-				startIdx := strings.Index(response, "[SEARCH:")
-				endIdx := strings.Index(response[startIdx:], "]")
+
+				// Find the closing bracket
+				endIdx := strings.Index(response[searchIdx:], "]")
 				if endIdx == -1 {
 					break
 				}
-				searchQuery := response[startIdx+8 : startIdx+endIdx]
+
+				// Extract query: handle [SEARCH:query] or [SEARCH RESULTS:query] etc.
+				tagContent := response[searchIdx : searchIdx+endIdx]
+				queryPart := tagContent
+				if colIdx := strings.Index(tagContent, ":"); colIdx != -1 {
+					queryPart = tagContent[colIdx+1:]
+				} else {
+					// Fallback if no colon: strip "[search " prefix
+					queryPart = strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(tagContent), "[search"), "results")
+				}
+				searchQuery := strings.TrimSpace(queryPart)
+
+				if searchQuery == "" {
+					break
+				}
+
 				log.Info().Msgf("Scheduled task AI requested web search: %s", searchQuery)
 
 				searchResults, _ := utils.SearchWeb(searchQuery)
-				prompt += fmt.Sprintf("\n\n### SEARCH RESULTS FOR \"%s\":\n%s\n\n(Based on these results, please provide your final response as Max.)", searchQuery, searchResults)
+				
+				// CRITICAL: Append the AI's previous response to the prompt 
+				// so it knows it already asked for this and is now seeing results.
+				prompt += fmt.Sprintf("\n\nMaximus: %s\n\n### SEARCH RESULTS FOR \"%s\":\n%s\n\n(Now, using these results, continue your response as Max. Be concise and natural.)", response, searchQuery, searchResults)
+				
 				response, _, _, err = ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
 				if err != nil {
 					break

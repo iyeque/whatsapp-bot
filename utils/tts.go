@@ -149,8 +149,10 @@ func ConvertToOggOpus(audioData []byte, inputFormat string) ([]byte, error) {
 	defer os.Remove(inPath)
 
 	// Convert to OGG Opus using FFmpeg
-	// WhatsApp expects OGG Opus for voice notes
-	cmd := exec.Command("ffmpeg", "-i", inPath, "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", "-compression_level", "10", "-y", outPath)
+	// -ar 24000: Resample to 24kHz
+	// -af highpass=f=200: Remove muddy low-end frequencies
+	// -b:a 64k: Standard bitrate
+	cmd := exec.Command("ffmpeg", "-i", inPath, "-ar", "24000", "-af", "highpass=f=200", "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", "-compression_level", "10", "-y", outPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ffmpeg conversion failed: %w; output: %s", err, string(output))
 	}
