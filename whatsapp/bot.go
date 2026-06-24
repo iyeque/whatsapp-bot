@@ -23,7 +23,6 @@ import (
 	"whatsapp-gpt-bot/ai"
 	"whatsapp-gpt-bot/cache"
 	"whatsapp-gpt-bot/queue"
-	"whatsapp-gpt-bot/types"
 	"whatsapp-gpt-bot/utils"
 
 	"go.mau.fi/whatsmeow"
@@ -90,6 +89,7 @@ type Bot struct {
 	mutedUntil        map[string]time.Time // Chats where Max took the wheel
 	consecutiveFailures map[string]int      // Track consecutive AI failures per chat
 	cron              *cron.Cron           // Scheduler for automated tasks
+	cronJobIDs        map[int]cron.EntryID // Map of DB task IDs to cron entry IDs
 }
 
 func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager, id string) (*Bot, error) {
@@ -111,6 +111,7 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 		mutedUntil:      make(map[string]time.Time),
 		consecutiveFailures: make(map[string]int),
 		cron:            cron.New(),
+		cronJobIDs:      make(map[int]cron.EntryID),
 	}
 	bot.cron.Start()
 
@@ -631,7 +632,8 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	userName = "User"
 	isMax = false
 	isFamily = false
-	if userID == b.humanAssistantJID || strings.Contains(userID, strings.Split(b.humanAssistantJID, "@")[0]) {
+	baseHumanJID := strings.Split(b.humanAssistantJID, "@")[0]
+	if userID == b.humanAssistantJID || strings.HasPrefix(userID, baseHumanJID) {
 		userName = "Max"
 		isMax = true
 	} else if strings.Contains(userID, "97375716663491") {
@@ -656,15 +658,6 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		utils.RecordLatency(time.Since(start))
 		utils.RecordTimeout(true)
 	}()
-
-	// Enqueue message for processing
-	b.messageQueue.Enqueue(types.Message{
-		ID:        msg.Info.ID,
-		Type:      types.TextMessage,
-		Content:   msg.Message.GetConversation(),
-		Timestamp: time.Now(),
-		ChatID:    chatID,
-	})
 
 	userMsg := msg.Message.GetConversation()
 	if userMsg == "" {
@@ -1971,7 +1964,7 @@ func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDyna
 }
 
 func (b *Bot) loadScheduledTasks() error {
-	rows, err := b.SqlDB.Query("SELECT target_jid, cron_expr, instruction, is_dynamic FROM scheduled_tasks")
+	rows, err := b.SqlDB.Query("SELECT id, target_jid, cron_expr, instruction, is_dynamic FROM scheduled_tasks")
 	if err != nil {
 		return fmt.Errorf("failed to query scheduled tasks: %w", err)
 	}
@@ -1979,9 +1972,10 @@ func (b *Bot) loadScheduledTasks() error {
 
 	count := 0
 	for rows.Next() {
+		var taskID int
 		var targetStr, cronExpr, instruction string
 		var isDynamic bool
-		if err := rows.Scan(&targetStr, &cronExpr, &instruction, &isDynamic); err != nil {
+		if err := rows.Scan(&taskID, &targetStr, &cronExpr, &instruction, &isDynamic); err != nil {
 			log.Error().Err(err).Msg("Error scanning scheduled task row")
 			continue
 		}
@@ -1998,12 +1992,13 @@ func (b *Bot) loadScheduledTasks() error {
 		instr := instruction
 		dyn := isDynamic
 
-		_, err = b.cron.AddFunc(cronExpr, func() {
+		entryID, err := b.cron.AddFunc(cronExpr, func() {
 			b.executeScheduledTask(tJID, instr, dyn)
 		})
 		if err != nil {
 			log.Error().Err(err).Msgf("Error re-scheduling task from DB: %s", cronExpr)
 		} else {
+			b.cronJobIDs[taskID] = entryID
 			count++
 		}
 	}
@@ -2041,7 +2036,13 @@ func (b *Bot) handleUnscheduleCommand(chat wtypes.JID, text string) {
 	if rows == 0 {
 		b.sendAcknowledgment(chat, "❌ No task found with ID: "+taskID)
 	} else {
-		b.sendAcknowledgment(chat, "✅ Task "+taskID+" removed. (Note: It will stop running immediately, but internal cron entry remains until next restart. Use '!resume' to fully refresh if critical.)")
+		if taskIDInt, err := strconv.Atoi(taskID); err == nil {
+			if entryID, ok := b.cronJobIDs[taskIDInt]; ok {
+				b.cron.Remove(entryID)
+				delete(b.cronJobIDs, taskIDInt)
+			}
+		}
+		b.sendAcknowledgment(chat, "✅ Task "+taskID+" removed.")
 	}
 }
 
