@@ -128,6 +128,110 @@ type localProvider struct{}
 
 func (l *localProvider) Name() string { return "local" }
 
+func isRateLimitError(err error, body []byte) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), "429") {
+		return true
+	}
+	var parsed map[string]interface{}
+	if jsonErr := json.Unmarshal(body, &parsed); jsonErr == nil {
+		if code, ok := parsed["code"].(string); ok && code == "token_quota_exceeded" {
+			return true
+		}
+		if msg, ok := parsed["message"].(string); ok && strings.Contains(msg, "Tokens per minute limit exceeded") {
+			return true
+		}
+	}
+	return false
+}
+
+func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
+	endpoint := os.Getenv("LMSTUDIO_ENDPOINT")
+	modelName := os.Getenv("LMSTUDIO_MODEL")
+	if endpoint == "" {
+		return "", 0, 0, fmt.Errorf("LMSTUDIO_ENDPOINT not configured")
+	}
+
+	var body interface{}
+	if strings.Contains(strings.ToLower(endpoint), "/chat") {
+		content := []map[string]interface{}{
+			{"type": "text", "text": prompt},
+		}
+		if len(mediaData) > 0 {
+			if strings.HasPrefix(mimeType, "image/") {
+				b64Img := base64.StdEncoding.EncodeToString(mediaData)
+				content = append(content, map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]string{
+						"url": fmt.Sprintf("data:%s;base64,%s", mimeType, b64Img),
+					},
+				})
+			} else if strings.HasPrefix(mimeType, "audio/") {
+				prompt = "[VOICE NOTE RECEIVED] " + prompt
+				content[0]["text"] = prompt
+			}
+		}
+		body = map[string]interface{}{
+			"model":    modelName,
+			"messages": []map[string]interface{}{{"role": "user", "content": content}},
+		}
+	} else {
+		body = map[string]interface{}{
+			"model": modelName,
+			"input": prompt,
+		}
+	}
+
+	headers := make(map[string]string)
+	start := time.Now()
+	bodyBytes, err := client.PostJSON(ctx, endpoint, headers, body)
+	latency := time.Since(start)
+	if err != nil {
+		return "", 0, latency, fmt.Errorf("LM Studio request failed: %w; body: %s", err, string(bodyBytes))
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		return "", 0, latency, fmt.Errorf("failed to parse LM Studio response: %w; body: %s", err, string(bodyBytes))
+	}
+
+	var text string
+	if choices, ok := parsed["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := c0["message"].(map[string]interface{}); ok {
+				if content, ok := msg["content"].(string); ok {
+					text = content
+				}
+			}
+			if text == "" {
+				if t, ok := c0["text"].(string); ok {
+					text = t
+				}
+			}
+		}
+	}
+	if text == "" {
+		if s, ok := parsed["response"].(string); ok {
+			text = s
+		}
+	}
+
+	tokens := 0
+	if usage, ok := parsed["usage"].(map[string]interface{}); ok {
+		if tt, ok := usage["total_tokens"].(float64); ok {
+			tokens = int(tt)
+		}
+	}
+
+	utils.RecordLMStudioMetrics(latency, tokens)
+	if text == "" {
+		return "", tokens, latency, fmt.Errorf("LM Studio produced no text; body: %s", string(bodyBytes))
+	}
+	return text, tokens, latency, nil
+}
+
 func (l *localProvider) Generate(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
 	aiEndpoint := os.Getenv("AI_ENDPOINT")
 	modelName := os.Getenv("MODEL_NAME")
@@ -180,6 +284,10 @@ func (l *localProvider) Generate(ctx context.Context, prompt string, mediaData [
 	bodyBytes, err := client.PostJSON(ctx, aiEndpoint, headers, body)
 	latency := time.Since(start)
 	if err != nil {
+		if os.Getenv("LMSTUDIO_ENABLED") == "true" && isRateLimitError(err, bodyBytes) {
+			log.Warn().Err(err).Str("endpoint", aiEndpoint).Msg("Primary AI rate-limited; falling back to LM Studio")
+			return callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
+		}
 		return "", 0, latency, fmt.Errorf("local AI request failed: %w; body: %s", err, string(bodyBytes))
 	}
 
