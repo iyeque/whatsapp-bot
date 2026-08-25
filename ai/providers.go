@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+
 	"whatsapp-gpt-bot/types"
 	"whatsapp-gpt-bot/utils"
 
@@ -18,6 +19,7 @@ const (
 	GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1/models/"
 	OPENAI_API_BASE = "https://api.openai.org/v1/"
 	GROQ_API_BASE   = "https://api.groq.com/openai/v1/"
+	OPENROUTER_API_BASE = "https://openrouter.ai/api/v1/"
 )
 
 // Provider is an abstraction for AI model providers.
@@ -37,6 +39,8 @@ func selectProvider() Provider {
 		switch strings.ToLower(p) {
 		case "local", "lmstudio":
 			return &localProvider{}
+		case "openrouter":
+			return &openRouterProvider{}
 		case "openai":
 			return &openaiProvider{}
 		case "gemini":
@@ -176,6 +180,7 @@ func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType
 		body = map[string]interface{}{
 			"model":    modelName,
 			"messages": []map[string]interface{}{{"role": "user", "content": content}},
+			"stream":   false,
 		}
 	} else {
 		body = map[string]interface{}{
@@ -232,6 +237,99 @@ func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType
 	return text, tokens, latency, nil
 }
 
+func callOpenRouter(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
+	endpoint := os.Getenv("OPENROUTER_ENDPOINT")
+	modelName := os.Getenv("OPENROUTER_MODEL")
+	if endpoint == "" {
+		endpoint = OPENROUTER_API_BASE + "chat/completions"
+	}
+	if modelName == "" {
+		modelName = "google/gemma-4-26b-a4b-it:free"
+	}
+
+	var body interface{}
+	if len(mediaData) > 0 && strings.HasPrefix(mimeType, "image/") {
+		b64Img := base64.StdEncoding.EncodeToString(mediaData)
+		body = map[string]interface{}{
+			"model": modelName,
+			"messages": []map[string]interface{}{
+				{"role": "user", "content": []map[string]interface{}{
+					{"type": "text", "text": prompt},
+					{"type": "image_url", "image_url": map[string]string{"url": fmt.Sprintf("data:%s;base64,%s", mimeType, b64Img)}},
+				}},
+			},
+		}
+	} else {
+		body = map[string]interface{}{
+			"model":    modelName,
+			"messages": []map[string]interface{}{{"role": "user", "content": prompt}},
+		}
+	}
+
+	headers := make(map[string]string)
+	if k := os.Getenv("OPENROUTER_API_KEY"); k != "" {
+		headers["Authorization"] = "Bearer " + k
+	} else if k := os.Getenv("OPENAI_API_KEY"); k != "" {
+		headers["Authorization"] = "Bearer " + k
+	} else if k := os.Getenv("AI_API_KEY"); k != "" {
+		headers["Authorization"] = "Bearer " + k
+	}
+
+	start := time.Now()
+	bodyBytes, err := client.PostJSON(ctx, endpoint, headers, body)
+	latency := time.Since(start)
+	if err != nil {
+		return "", 0, latency, fmt.Errorf("OpenRouter request failed: %w; body: %s", err, string(bodyBytes))
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		return "", 0, latency, fmt.Errorf("failed to parse OpenRouter response: %w; body: %s", err, string(bodyBytes))
+	}
+
+	var text string
+	if choices, ok := parsed["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := c0["message"].(map[string]interface{}); ok {
+				if content, ok := msg["content"].(string); ok {
+					text = content
+				}
+			}
+			if text == "" {
+				if t, ok := c0["text"].(string); ok {
+					text = t
+				}
+			}
+		}
+	}
+	if text == "" {
+		if s, ok := parsed["response"].(string); ok {
+			text = s
+		}
+	}
+
+	tokens := 0
+	if usage, ok := parsed["usage"].(map[string]interface{}); ok {
+		if tt, ok := usage["total_tokens"].(float64); ok {
+			tokens = int(tt)
+		}
+	}
+
+	utils.RecordLMStudioMetrics(latency, tokens)
+	if text == "" {
+		return "", tokens, latency, fmt.Errorf("OpenRouter produced no text; body: %s", string(bodyBytes))
+	}
+	return text, tokens, latency, nil
+}
+
+type openRouterProvider struct{}
+
+func (o *openRouterProvider) Name() string { return "openrouter" }
+
+func (o *openRouterProvider) Generate(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
+	return callOpenRouter(ctx, prompt, mediaData, mimeType, timeout)
+}
+
 func (l *localProvider) Generate(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
 	aiEndpoint := os.Getenv("AI_ENDPOINT")
 	modelName := os.Getenv("MODEL_NAME")
@@ -274,7 +372,9 @@ func (l *localProvider) Generate(ctx context.Context, prompt string, mediaData [
 	}
 
 	headers := make(map[string]string)
-	if k := os.Getenv("OPENAI_API_KEY"); k != "" {
+	if k := os.Getenv("OPENROUTER_API_KEY"); k != "" {
+		headers["Authorization"] = "Bearer " + k
+	} else if k := os.Getenv("OPENAI_API_KEY"); k != "" {
 		headers["Authorization"] = "Bearer " + k
 	} else if k := os.Getenv("AI_API_KEY"); k != "" {
 		headers["Authorization"] = "Bearer " + k
@@ -284,9 +384,21 @@ func (l *localProvider) Generate(ctx context.Context, prompt string, mediaData [
 	bodyBytes, err := client.PostJSON(ctx, aiEndpoint, headers, body)
 	latency := time.Since(start)
 	if err != nil {
-		if os.Getenv("LMSTUDIO_ENABLED") == "true" && isRateLimitError(err, bodyBytes) {
-			log.Warn().Err(err).Str("endpoint", aiEndpoint).Msg("Primary AI rate-limited; falling back to LM Studio")
-			return callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
+		if os.Getenv("LMSTUDIO_ENABLED") == "true" {
+			log.Warn().Err(err).Str("endpoint", aiEndpoint).Msg("Primary AI failed; falling back to LM Studio")
+			if lmText, lmTokens, lmLatency, lmErr := callLMStudio(ctx, prompt, mediaData, mimeType, timeout); lmErr == nil {
+				return lmText, lmTokens, lmLatency, nil
+			} else {
+				log.Warn().Err(lmErr).Msg("LM Studio fallback failed")
+			}
+		}
+		if os.Getenv("OPENROUTER_ENABLED") == "true" {
+			log.Warn().Err(err).Str("endpoint", aiEndpoint).Msg("Primary AI failed; falling back to OpenRouter")
+			if orText, orTokens, orLatency, orErr := callOpenRouter(ctx, prompt, mediaData, mimeType, timeout); orErr == nil {
+				return orText, orTokens, orLatency, nil
+			} else {
+				log.Warn().Err(orErr).Msg("OpenRouter fallback failed")
+			}
 		}
 		return "", 0, latency, fmt.Errorf("local AI request failed: %w; body: %s", err, string(bodyBytes))
 	}

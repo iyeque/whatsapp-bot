@@ -52,6 +52,12 @@ Provide the updated content for soul.md, or "NO_CHANGE". Respond ONLY with the c
 		return
 	}
 
+	// Guard identity consistency: reflection must not rename maximus or introduce Astra.
+	if strings.Contains(response, "Astra") || !strings.Contains(strings.ToLower(response), "maximus") {
+		log.Warn().Msg("Soul reflection blocked: identity drift detected; keeping current soul.md")
+		return
+	}
+
 	// Backup current soul
 	os.WriteFile("soul.md.bak", soulContent, 0644)
 	

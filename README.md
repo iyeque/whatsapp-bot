@@ -18,7 +18,7 @@ An advanced, context-aware "Digital Twin" WhatsApp bot. Maximus integrates with 
 - Go 1.24+
 - FFmpeg (for audio conversion)
 - Local Whisper.cpp & NeuTTS-Air (optional for local voice)
-- LM Studio / Gemini / Groq / Cerebras API Keys
+- LM Studio / Gemini / Groq / OpenRouter API Keys
 
 ## 📦 Installation & Setup
 
@@ -31,9 +31,13 @@ An advanced, context-aware "Digital Twin" WhatsApp bot. Maximus integrates with 
 2. **Configure `.env`**:
    ```env
    DB_PATH=./whatsapp.db
-   GEMINI_API_KEY=your_key
-   CEREBRAS_API_KEY=your_key
-   AI_ENDPOINT=http://localhost:1234/v1/chat/completions
+   OPENAI_API_KEY=your_openrouter_key
+   AI_PROVIDER=LOCAL
+   AI_ENDPOINT=http://127.0.0.1:1234/v1/chat/completions
+   LMSTUDIO_ENABLED=true
+   OPENROUTER_ENABLED=true
+   OPENROUTER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions
+   OPENROUTER_MODEL=google/gemma-4-26b-a4b-it:free
    HUMAN_ASSISTANT_JID=your_jid@s.whatsapp.net
    ```
 
@@ -66,4 +70,4 @@ An advanced, context-aware "Digital Twin" WhatsApp bot. Maximus integrates with 
 5. **Back-off**: If Max replies from his phone, the bot mutes itself for 2 minutes to allow natural human conversation.
 
 ## Acknowledgment
-Built with `go-whatsmeow` and `LM Studio`. Special focus on privacy and local-first AI.
+Built with `go-whatsmeow`, `LM Studio`, and `OpenRouter`. Special focus on privacy and local-first AI with remote fallback.

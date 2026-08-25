@@ -223,6 +223,23 @@ func runExternalCommand(cmdStr string, dir string, name string, logger waLog.Log
 			return
 		}
 
+		// On Windows, a socket can remain in TIME_WAIT after the process exits.
+		// If the port is still bound when we loop around to restart, kill any
+		// lingering process holding it so the new instance can bind.
+		if name == "tts" {
+			port := os.Getenv("TTS_PORT")
+			if port == "" {
+				port = "18081"
+			}
+			// PowerShell one-liner: find PIDs listening on the port, kill them.
+			psScript := fmt.Sprintf(
+				"$pids = (Get-NetTCPConnection -LocalPort %s -State Listen).OwningProcess | Select-Object -Unique; "+
+					"if ($pids) { Stop-Process -Id $pids -Force -ErrorAction SilentlyContinue }",
+				port,
+			)
+			_ = exec.Command("powershell", "-NoProfile", "-Command", psScript).Run()
+		}
+
 		cmd := exec.Command(args[0], args[1:]...)
 		if dir != "" {
 			cmd.Dir = dir

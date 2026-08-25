@@ -165,10 +165,10 @@ const (
 func getInitialTimeout() time.Duration {
 	if timeoutStr := os.Getenv("AI_TIMEOUT"); timeoutStr != "" {
 		if t, err := strconv.Atoi(timeoutStr); err == nil && t > 0 {
-			return time.Duration(t) * time.Second / 2 // Start at half of max
+			return time.Duration(t) * time.Second
 		}
 	}
-	return 30 * time.Second
+	return 300 * time.Second
 }
 
 func getMaxTimeout() time.Duration {
@@ -239,7 +239,7 @@ func (b *Bot) handleLoggedOut(evt interface{}) {
 }
 
 func (b *Bot) handleMessage(evt interface{}) {
-	log.Info().Msgf("TRACE: Event received: %+v", evt)
+	log.Debug().Msgf("Event received: %T", evt)
 	switch v := evt.(type) {
 	case *events.Message:
 		// Extract text immediately (handling edits)
@@ -687,44 +687,35 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	}
 	utils.IncrementCacheMiss()
 
-	// Check if this is a first-time texter (only 1 message from user, no messages from assistant yet)
+	// Check if the user already has a personality profile
 	b.mutex.RLock()
 	conv, exists := b.conversations[chatID]
-	isFirstTime := exists && len(conv.Messages) == 1 && conv.Messages[0].Role == "user"
 	b.mutex.RUnlock()
-
-	// Check if the user already has a personality profile
 	_, hasPersonality := b.vectorStore.UserPersonality[userID]
 
-	// 1. Initial Conversation: Ask personality test to first-time texters (if not Max/Family and no profile yet)
+	// Note: Auto personality test offer for first-time texters is disabled.
+	// Users start with normal conversation unless they explicitly request a personality test.
+
+	// Send a brief intro for first-time conversations.
+	isFirstTime := exists && len(conv.Messages) == 1 && conv.Messages[0].Role == "user"
 	if isFirstTime && !isMax && !isFamily && !hasPersonality {
-		log.Debug().Msgf("First-time texter detected (%s). Offering optional personality test.", userID)
-		testType := "mbti" // Default to MBTI for first-timers
-		testTemplate := b.vectorStore.GetPersonalityTestTemplate(testType)
-
-		welcomeMsg := "Hello! I'm maximus, Max's digital assistant. To help me communicate with you more effectively, I've prepared a few quick questions to understand your personality type.\n\n" +
-			testTemplate +
-			"\n\n*Note: This is optional! You can answer the questions above, or just start chatting with me normally and I'll adapt as we go.*"
-
-		// Add the test message to conversation history
+		log.Debug().Msgf("First-time texter detected (%s). Sending intro message.", userID)
+		introMsg := "I'm maximus, Max's digital clone. I can help with pretty much anything AI-related, from research and writing to brainstorming and automation. If you want, I can also give you a quick personality test to help tailor how I communicate."
 		b.mutex.Lock()
 		assistantMessage := BotMessage{
 			Role:    "assistant",
-			Content: welcomeMsg,
+			Content: introMsg,
 			Time:    time.Now(),
 		}
 		b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, assistantMessage)
 		b.mutex.Unlock()
-
-		// Save to database
 		if err := b.saveMessageToDB(chatID, assistantMessage); err != nil {
-			log.Error().Err(err).Msg("Error saving test message to DB")
+			log.Error().Err(err).Msg("Error saving intro message to DB")
 		}
 		if err := b.saveConversationToDB(chatID, b.conversations[chatID]); err != nil {
 			log.Error().Err(err).Msg("Error saving conversation to DB")
 		}
-
-		b.sendAcknowledgment(msg.Info.Chat, welcomeMsg)
+		b.sendAcknowledgment(msg.Info.Chat, introMsg)
 		return
 	}
 
@@ -888,9 +879,9 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	} else {
 		// When talking to others, the persona is Max's personality
 		botPersona = personalityDoc + "\n\n### TRUTH JOURNAL (PRIORITY FACTS):\n" + truthDoc
-		roleInstruction = fmt.Sprintf("You are responding ON BEHALF of Max to %s. You ARE Max's digital twin. You must speak as if you ARE Max. Use 'I', 'me', 'my' to refer to yourself as Max. Do NOT mention you are an AI or an assistant (unless you are at the very beginning of the relationship or specifically asked). Be natural, warm, and concise.", userName)
+		roleInstruction = fmt.Sprintf("You are maximus. In this conversation, you are speaking on behalf of Max as his digital twin. Speak naturally, warmly, and concisely. You may use 'I', 'me', 'my' when reflecting Max's own experiences or actions, but DO NOT attribute Max's personal details, relationships, or life story to %s. Keep the conversation centered on what %s actually says or asks about.", userName, userName)
 		if isFamily && userName == "Wilma" {
-			roleInstruction += " You are talking to your wife, Wilma. Be affectionate and natural, but remember you are also her digital assistant ('maximus') helping her with tasks like tests or information. Stay focused on her current requests and do NOT hallucinate unrelated personal details (like dinner plans) unless she brings them up."
+			roleInstruction += " You are talking to your wife, Wilma. Be affectionate and natural, but remember you are also her digital assistant ('maximus') helping her with tasks. Stay focused on her current requests and do NOT hallucinate unrelated personal details unless she brings them up."
 		} else if isFamily && (userName == "Stephanie" || userName == "Nicki") {
 			roleInstruction += fmt.Sprintf(" You are talking to your sister, %s. Be natural as a brother would be. Stay chill and do NOT make up stories or plans.", userName)
 		}
@@ -948,6 +939,7 @@ The search results will be provided to you immediately. Use this to be the most 
 - Respond naturally and concisely. Avoid bullet points unless specifically asked for a list.
 - If talking to Max, you are his assistant.
 - If talking to %s (not Max), you ARE Max.
+- Use emojis sparingly. One emoji per message is enough; avoid emoji-heavy replies like "??" or "!". Prefer plain text unless an emoji genuinely adds warmth or clarity.
 
 ### CONVERSATION FLOW:
 - Pay close attention to the RECENT HISTORY.

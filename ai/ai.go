@@ -57,7 +57,17 @@ func MakeAIRequest(prompt string, mediaData []byte, mimeType string, timeout tim
 			if err == nil {
 				return res, tokens, latency, nil
 			}
-			log.Warn().Err(err).Msg("Gemini media request failed, falling back to primary text provider")
+			log.Warn().Err(err).Msg("Gemini media request failed, trying next provider")
+		}
+
+		if os.Getenv("OPENROUTER_ENABLED") == "true" {
+			p = &openRouterProvider{}
+			log.Debug().Msg("Media detected. Attempting OpenRouter for multi-modal processing.")
+			res, tokens, latency, err = p.Generate(ctx, prompt, mediaData, mimeType, timeout)
+			if err == nil {
+				return res, tokens, latency, nil
+			}
+			log.Warn().Err(err).Msg("OpenRouter media request failed, trying next provider")
 		}
 	}
 
