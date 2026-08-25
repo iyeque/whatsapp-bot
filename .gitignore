@@ -23,3 +23,7 @@ logs/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Embedding caches / soul backups
+*.embedding.json
+soul.md.bak
