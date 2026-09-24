@@ -129,7 +129,7 @@ func (am *AccountManager) LoadBots() error {
 		return fmt.Errorf("failed to get devices: %v", err)
 	}
 
-	for _, device := range devices {
+	for i, device := range devices {
 		client := whatsmeow.NewClient(device, am.logger)
 
 		am.mutex.Lock()
@@ -143,7 +143,11 @@ func (am *AccountManager) LoadBots() error {
 		am.bots[botID] = bot
 		am.mutex.Unlock()
 
-		go func(b *Bot) {
+		go func(b *Bot, idx int) {
+			// Stagger bot connections so they don't all hit WhatsApp sync + OpenRouter at the same time
+			staggerSec := time.Duration(idx) * 8 * time.Second
+			time.Sleep(staggerSec)
+
 			maxRetries := 5
 			for i := 0; i < maxRetries; i++ {
 				if err := b.Connect(); err != nil {
@@ -156,7 +160,7 @@ func (am *AccountManager) LoadBots() error {
 					return // Connected successfully
 				}
 			}
-		}(bot)
+		}(bot, i)
 	}
 
 	return nil

@@ -136,16 +136,42 @@ func isRateLimitError(err error, body []byte) bool {
 	if err == nil {
 		return false
 	}
-	if strings.Contains(err.Error(), "429") {
+	errStr := err.Error()
+	// Catch HTTP 429 status in error string (various HTTP client formats)
+	if strings.Contains(errStr, "429") {
+		return true
+	}
+	// Catch OpenRouter-specific rate limit error format
+	if strings.Contains(errStr, "rate_limit_exceeded") || strings.Contains(errStr, "rate-limited") {
 		return true
 	}
 	var parsed map[string]interface{}
-	if jsonErr := json.Unmarshal(body, &parsed); jsonErr == nil {
+	if body != nil && json.Unmarshal(body, &parsed) == nil {
 		if code, ok := parsed["code"].(string); ok && code == "token_quota_exceeded" {
 			return true
 		}
-		if msg, ok := parsed["message"].(string); ok && strings.Contains(msg, "Tokens per minute limit exceeded") {
+		if msg, ok := parsed["message"].(string); ok {
+			if strings.Contains(msg, "Tokens per minute limit exceeded") || strings.Contains(msg, "rate_limit_exceeded") || strings.Contains(msg, "rate-limited") {
+				return true
+			}
+		}
+		// OpenRouter nested error format
+		if meta, ok := parsed["metadata"].(map[string]interface{}); ok {
+			if raw, ok := meta["raw"].(string); ok && strings.Contains(raw, "rate-limited") {
+				return true
+			}
+		}
+		// Direct 429 code in response
+		if code, ok := parsed["code"].(float64); ok && code == 429 {
 			return true
+		}
+		if code, ok := parsed["error"].(map[string]interface{}); ok {
+			if c, ok := code["code"].(float64); ok && c == 429 {
+				return true
+			}
+			if c, ok := code["code"].(string); ok && c == "rate_limit_exceeded" {
+				return true
+			}
 		}
 	}
 	return false
@@ -279,7 +305,26 @@ func callOpenRouter(ctx context.Context, prompt string, mediaData []byte, mimeTy
 	bodyBytes, err := client.PostJSON(ctx, endpoint, headers, body)
 	latency := time.Since(start)
 	if err != nil {
+		// Detect 429 in the error string too (some HTTP clients include the status code in the error message)
+		if isRateLimitError(err, nil) {
+			log.Warn().Str("endpoint", endpoint).Msg("OpenRouter returned 429 (network error) — attempting fallback to LM Studio")
+			lmText, lmTokens, lmLatency, lmErr := callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
+			if lmErr == nil {
+				return lmText, lmTokens, lmLatency, nil
+			}
+			log.Warn().Err(lmErr).Msg("LM Studio fallback also failed")
+		}
 		return "", 0, latency, fmt.Errorf("OpenRouter request failed: %w; body: %s", err, string(bodyBytes))
+	}
+
+	// Detect rate-limit (429) in the response body and fall back to LM Studio
+	if strings.Contains(string(bodyBytes), `"code":429`) || strings.Contains(string(bodyBytes), `"status":429`) || strings.Contains(string(bodyBytes), "rate_limit_exceeded") || strings.Contains(string(bodyBytes), "rate-limited") {
+		log.Warn().Str("endpoint", endpoint).Msg("OpenRouter returned 429 — attempting fallback to LM Studio")
+		lmText, lmTokens, lmLatency, lmErr := callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
+		if lmErr == nil {
+			return lmText, lmTokens, lmLatency, nil
+		}
+		log.Warn().Err(lmErr).Msg("LM Studio fallback also failed")
 	}
 
 	var parsed map[string]interface{}

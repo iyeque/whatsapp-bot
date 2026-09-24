@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"regexp"
 	"time"
 
 	"github.com/ledongthuc/pdf"
@@ -47,6 +48,7 @@ type Conversation struct {
 	LastActive           time.Time
 	Summary              string
 	LastMessageTimestamp time.Time
+	UserName             string
 }
 
 type CacheEntry struct {
@@ -115,6 +117,15 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 	}
 	bot.cron.Start()
 
+	// Schedule the daily summary (default: 18:00 UTC). Override with DAILY_SUMMARY_CRON env var.
+	cronExpr := os.Getenv("DAILY_SUMMARY_CRON")
+	if cronExpr == "" {
+		cronExpr = "0 18 * * *"
+	}
+	if _, err := bot.cron.AddFunc(cronExpr, bot.dailySummary); err != nil {
+		log.Error().Err(err).Msgf("Failed to schedule daily summary with cron expression %q", cronExpr)
+	}
+
 	// Parse IGNORED_CHAT_JIDS environment variable
 	if ignoredJIDsStr := os.Getenv("IGNORED_CHAT_JIDS"); ignoredJIDsStr != "" {
 		for _, jid := range strings.Split(ignoredJIDsStr, ",") {
@@ -154,7 +165,7 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 const (
 	GEMINI_API_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key="
 	MAX_TOKENS      = 4096
-	MAX_HISTORY     = 20
+	MAX_HISTORY     = 10
 	DEFAULT_TIMEOUT = 300 * time.Second
 	MIN_TIMEOUT     = 10 * time.Second
 	MAX_RETRIES     = 2
@@ -536,8 +547,9 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 	var summary sql.NullString
 	var lastActive time.Time
 	var lastMessageTimestamp time.Time
-	row := b.SqlDB.QueryRow("SELECT summary, last_active, last_message_timestamp FROM conversations WHERE chat_id = ?", chatID)
-	if err := row.Scan(&summary, &lastActive, &lastMessageTimestamp); err != nil {
+	var userName string
+	row := b.SqlDB.QueryRow("SELECT summary, last_active, last_message_timestamp, user_name FROM conversations WHERE chat_id = ?", chatID)
+	if err := row.Scan(&summary, &lastActive, &lastMessageTimestamp, &userName); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil // Not found
 		}
@@ -545,6 +557,7 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 	}
 
 	conv := &Conversation{
+		UserName:             userName,
 		LastActive:           lastActive,
 		Summary:              summary.String,
 		Messages:             make([]BotMessage, 0),
@@ -649,6 +662,12 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		userName = msg.Info.PushName
 	}
 
+	// Persist the resolved user name on the conversation (for daily summary, etc.).
+	if conv, exists := b.conversations[chatID]; exists && conv.UserName == "" {
+		conv.UserName = userName
+		b.saveConversationToDB(chatID, conv)
+	}
+
 	// If the message is from the human assistant, log it but continue processing to allow a response
 	if isMax {
 		log.Debug().Msgf("Message from human assistant (%s). Processing and responding.", msg.Info.Sender.String())
@@ -661,6 +680,12 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 
 	userMsg := msg.Message.GetConversation()
 	if userMsg == "" {
+		return
+	}
+
+	// Escalation: if a non-Max user asks to talk to Max, alert Max and reassure the user.
+	if !isMax && b.shouldEscalateToMax(userMsg) {
+		b.escalateToMax(chatID, msg.Info.Chat, userName, userMsg)
 		return
 	}
 
@@ -814,21 +839,13 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	}
 
 	var historyMessages []string
-	var archivedHistoryBuilder strings.Builder
 	b.mutex.RLock()
 	convForPrompt, _ := b.conversations[chatID]
-	if convForPrompt.Summary != "" {
-		archivedHistoryBuilder.WriteString("Summary of earlier conversation: " + convForPrompt.Summary + "\n\n")
-	}
 
-	now := time.Now()
-	oneDayAgo := now.Add(-24 * time.Hour)
-	hasArchived := convForPrompt.Summary != ""
-
-	// Limit history to avoid overly long prompts
+	// Build recent history from messages (last 12 max)
 	startIdx := 0
-	if len(convForPrompt.Messages) > 40 {
-		startIdx = len(convForPrompt.Messages) - 40
+	if len(convForPrompt.Messages) > 12 {
+		startIdx = len(convForPrompt.Messages) - 12
 	}
 	for _, message := range convForPrompt.Messages[startIdx:] {
 		sender := message.Role
@@ -840,20 +857,14 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		// Clean history from tags to prevent re-triggering and hallucinations
 		cleanContent := CleanResponse(message.Content)
 		formattedMsg := fmt.Sprintf("%s: %s\n", sender, cleanContent)
-
-		if message.Time.Before(oneDayAgo) {
-			archivedHistoryBuilder.WriteString(formattedMsg)
-			hasArchived = true
-		} else {
-			historyMessages = append(historyMessages, formattedMsg)
-		}
+		historyMessages = append(historyMessages, formattedMsg)
 	}
 	b.mutex.RUnlock()
 
-	// SAFETY CAP: Limit archived history to 4,000 characters
-	archivedHistoryStr := archivedHistoryBuilder.String()
-	if len(archivedHistoryStr) > 4000 {
-		archivedHistoryStr = archivedHistoryStr[len(archivedHistoryStr)-4000:]
+	// Build archived context from conversation summary ONLY (not raw old messages)
+	var archivedSection string
+	if convForPrompt.Summary != "" {
+		archivedSection = fmt.Sprintf("\n### PRIOR CONVERSATION CONTEXT (AWARENESS ONLY — DO NOT MENTION OR REFER TO):\n%s\n*You are aware of this prior context. Do NOT bring up old topics from it unless %s explicitly asks about them. Start fresh based only on the Recent History below.*\n", convForPrompt.Summary, userName)
 	}
 
 	var roleInstruction string
@@ -887,12 +898,6 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		}
 	}
 
-	// Build the archived context section
-	archivedSection := ""
-	if hasArchived {
-		archivedSection = fmt.Sprintf("\n### PRIOR CONVERSATION CONTEXT (FYI ONLY):\n%s\n*IMPORTANT: This context is from prior days/conversations. You are AWARE of it, but you MUST NOT mention it, refer to it, or bring up old topics from it unless %s explicitly asks about them. Start the current interaction fresh based only on the Recent History.*\n", archivedHistoryStr, userName)
-	}
-
 	// SAFETY CAP: Build recent history string, trimming oldest messages if it exceeds 10,000 chars
 	recentHistoryStr := ""
 	for i := 0; i < len(historyMessages); i++ {
@@ -914,8 +919,8 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 %s
 
 ### EMOTIONAL REACTIONS:
-You can physically react to the user's message with an emoji. To do this, include the tag [REACT:emoji] at the very end of your response. 
-CRITICAL: Use a colon between REACT and the emoji. Example: "That's hilarious! [REACT:😂]"
+You MAY include a [REACT:emoji] tag at the very end of your response if the moment genuinely calls for it. Use a colon between REACT and the emoji. Example: "That's hilarious! [REACT:😂]"
+NEVER force a reaction — if the message doesn't warrant one, don't include it.
 
 ### VOICE RESPONSES:
 If the user sends you a voice note, or if you want to respond with your actual voice, include the tag [VOICE] at the end of your response.
@@ -933,6 +938,7 @@ The search results will be provided to you immediately. Use this to be the most 
 - **BE CHILL.** If someone says "hi", "hey", or something similar, respond simply with "hey, how's it going?" or "what's up?". Do NOT over-explain or add unnecessary context to simple greetings.
 - **DO NOT HALLUCINATE.** Do NOT make up stories about where you are (e.g., "just got back into town"), what you are doing, or your current plans unless they are explicitly in the Recent History. If you don't know, don't mention it.
 - **DO NOT THINK OUT LOUD.** Do not include bracketed comments about your logic (e.g., "(If Wilma answers...)"). Only output the actual response.
+- **NEVER output structured blocks like "YOUR TASK:", "Here is a neutral response:", "### Response:", or any meta-reasoning about what you should say.** Only output the actual message text you want to send — nothing else.
 - DO NOT summarize your personality or identity.
 - DO NOT mention personality tests, Enneagrams, or MBTI types UNLESS the user is currently taking one or asks about it.
 - NEVER offer personality tests to Max or his family (Wilma, Stephanie, Nicki). You already know them.
@@ -944,7 +950,7 @@ The search results will be provided to you immediately. Use this to be the most 
 ### CONVERSATION FLOW:
 - Pay close attention to the RECENT HISTORY.
 - DO NOT repeat jokes, stories, or questions you have already asked in the history. If you just told a joke, tell a completely different one next time.
-- If you just asked a question (like Question 1) and the user responded, move to the NEXT STEP (like Question 2). 
+- If you just asked a question (like Question 1) and the user responded, move to the NEXT STEP (like Question 2).
 - DO NOT repeat the same question multiple times in a row.
 - If conducting a personality test, move through the questions one by one.
 - If the user has finished a test, tell them their result based on their answers.
@@ -1492,6 +1498,7 @@ func (b *Bot) initDBSchema() error {
 	createConversationsTableSQL := `
 	CREATE TABLE IF NOT EXISTS conversations (
 		chat_id TEXT PRIMARY KEY,
+		user_name TEXT,
 		summary TEXT,
 		last_active DATETIME,
 		last_message_timestamp DATETIME DEFAULT '1970-01-01 00:00:00+00:00'
@@ -1640,8 +1647,9 @@ func (b *Bot) loadConversationsFromDB() error {
 
 func (b *Bot) saveConversationToDB(chatID string, conv *Conversation) error {
 	_, err := b.SqlDB.Exec(
-		"INSERT INTO conversations (chat_id, summary, last_active, last_message_timestamp) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET summary = ?, last_active = ?, last_message_timestamp = ?",
-		chatID, conv.Summary, conv.LastActive, conv.LastMessageTimestamp, conv.Summary, conv.LastActive, conv.LastMessageTimestamp,
+		"INSERT INTO conversations (chat_id, user_name, summary, last_active, last_message_timestamp) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET user_name = ?, summary = ?, last_active = ?, last_message_timestamp = ?",
+		chatID, conv.UserName, conv.Summary, conv.LastActive, conv.LastMessageTimestamp,
+		conv.UserName, conv.Summary, conv.LastActive, conv.LastMessageTimestamp,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save conversation %s to DB: %w", chatID, err)
@@ -1955,6 +1963,114 @@ func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDyna
 	b.sendAcknowledgment(target, "⏰ *Scheduled Task:*\n\n"+finalContent)
 }
 
+// dailySummary compiles today's conversations into a per-person summary and sends it to Max.
+// Intended to be scheduled via cron (e.g. "0 18 * * *" for 18:00 UTC each day).
+func (b *Bot) dailySummary() {
+	now := time.Now()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	endOfDay := startOfDay.Add(24 * time.Hour)
+
+	// Query distinct chat IDs that had messages today
+	rows, err := b.SqlDB.Query(
+		"SELECT DISTINCT conversation_chat_id FROM messages WHERE timestamp >= ? AND timestamp < ?",
+		startOfDay, endOfDay,
+	)
+	if err != nil {
+		log.Error().Err(err).Msg("dailySummary: failed to query today's chats")
+		return
+	}
+	defer rows.Close()
+
+	type personEntry struct {
+		name   string
+		messages []string
+	}
+	persons := make(map[string]*personEntry)
+	var personOrder []string
+
+	for rows.Next() {
+		var chatID string
+		if err := rows.Scan(&chatID); err != nil {
+			continue
+		}
+		// Get the user name for this chat from messages (the "user" role messages carry the name we stored)
+		msgRows, err := b.SqlDB.Query(
+			"SELECT role, content FROM messages WHERE conversation_chat_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC",
+			chatID, startOfDay, endOfDay,
+		)
+		if err != nil || msgRows == nil {
+			continue
+		}
+		// Use a closure so defer msgRows.Close() runs at end of this iteration
+		// even if the inner loop panics or exits early, preventing row-resource leaks.
+		var userName string
+		var allMessages []string
+		func() {
+			defer msgRows.Close()
+			for msgRows.Next() {
+				var role, content string
+				if err := msgRows.Scan(&role, &content); err != nil {
+					continue
+				}
+				if role == "user" && userName == "" {
+					// First user message content — we stored the sender name prefix in history,
+					// but in DB we only have raw content. Reconstruct name from conversations table summary
+					// or fall back to "User".
+					userName = "Someone"
+				}
+				if role == "user" {
+					clean := CleanResponse(content)
+					if clean != "" {
+						allMessages = append(allMessages, clean)
+					}
+				}
+			}
+		}()
+		if userName == "" {
+			userName = "Someone"
+		}
+		if _, exists := persons[userName]; !exists {
+			persons[userName] = &personEntry{name: userName}
+			personOrder = append(personOrder, userName)
+		}
+		persons[userName].messages = append(persons[userName].messages, allMessages...)
+	}
+
+	if len(persons) == 0 {
+		log.Info().Msg("dailySummary: no activity today")
+		return
+	}
+
+	// Build summary text
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📊 *Daily Summary — %s*\n\n", startOfDay.Format("Monday, January 2, 2025")))
+	for _, name := range personOrder {
+		entry := persons[name]
+		sb.WriteString(fmt.Sprintf("*• %s* (%d messages)\n", name, len(entry.messages)))
+		// Show last 5 user messages as conversation highlights
+		start := 0
+		if len(entry.messages) > 5 {
+			start = len(entry.messages) - 5
+		}
+		for _, msg := range entry.messages[start:] {
+			// Truncate long messages
+			display := msg
+			if len(display) > 120 {
+				display = display[:117] + "..."
+			}
+			sb.WriteString(fmt.Sprintf("  – %s\n", display))
+		}
+		sb.WriteString("\n")
+	}
+
+	summaryText := sb.String()
+	targetJID, err := wtypes.ParseJID(b.humanAssistantJID)
+	if err == nil {
+		b.sendAcknowledgment(targetJID, summaryText)
+		log.Info().Msg("dailySummary: sent summary to Max")
+	}
+}
+
 func (b *Bot) loadScheduledTasks() error {
 	rows, err := b.SqlDB.Query("SELECT id, target_jid, cron_expr, instruction, is_dynamic FROM scheduled_tasks")
 	if err != nil {
@@ -2155,6 +2271,58 @@ func (b *Bot) handleCorrectCommand(chat wtypes.JID, correction string) {
 	}
 	
 	b.sendAcknowledgment(chat, "✅ Correction noted. My apologies for the misinformation—let me clarify: " + correction)
+}
+
+// shouldEscalateToMax returns true if the user message is a request to speak with the real Max.
+func (b *Bot) shouldEscalateToMax(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	// Direct requests to speak with Max
+	talkPhrases := []string{
+		"talk to max", "speak to max", "talk to the real max", "talk to real max",
+		"let me talk to max", "let me speak to max", "i want to talk to max",
+		"i want to speak to max", "can i talk to max", "can i speak to max",
+		"can we talk", "can we speak", "connect me to max", "put me through to max",
+		"get max", "get maximus", "get the real max",
+	}
+	for _, phrase := range talkPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	// Short forms: "max" as a standalone request when preceded by ask/need/want
+	if matched, err := regexp.MatchString(`(?i)\b(max|maximus)\b.*\b(talk|speak|connect|get|put me through)\b`, message); err != nil {
+		log.Error().Err(err).Msg("shouldEscalateToMax: regex compilation failed for max-first pattern")
+	} else if matched {
+		return true
+	}
+	if matched, err := regexp.MatchString(`(?i)\b(talk|speak|connect|put me through).*\b(max|maximus)\b`, message); err != nil {
+		log.Error().Err(err).Msg("shouldEscalateToMax: regex compilation failed for talk-first pattern")
+	} else if matched {
+		return true
+	}
+	return false
+}
+
+// escalateToMax notifies the human assistant that someone wants to talk to Max,
+// and sends a reassurance to the user.
+func (b *Bot) escalateToMax(chatID string, chat wtypes.JID, userName string, userMsg string) {
+	// Alert Max
+	alertMsg := fmt.Sprintf("📞 *Someone wants to talk to you*\n\n"+
+		"Person: %s\n"+
+		"Chat: %s\n"+
+		"Message: %s\n\n"+
+		"They asked to speak with you directly. Please reach out when you can.",
+		userName, chatID, userMsg)
+
+	targetJID, err := wtypes.ParseJID(b.humanAssistantJID)
+	if err == nil {
+		b.sendAcknowledgment(targetJID, alertMsg)
+		log.Info().Msgf("Escalation sent to Max for %s (%s)", userName, chatID)
+	}
+
+	// Reassure the user
+	reassurance := fmt.Sprintf("I've let Max know you'd like to speak with him. He'll get back to you as soon as he can. In the meantime, I'm here to help with anything else.")
+	b.sendAcknowledgment(chat, reassurance)
 }
 
 // triggerHITLAlert notifies the human assistant that the bot is stuck and pauses autopilot for that chat.
