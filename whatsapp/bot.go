@@ -1549,6 +1549,36 @@ func (b *Bot) initDBSchema() error {
 		return fmt.Errorf("failed to create conversations table: %w", err)
 	}
 
+	// Migration: add user_name column if it doesn't exist (existing DBs created before this column was added).
+	// Check PRAGMA table_info first — SQLite ALTER TABLE ADD COLUMN throws "duplicate column name" if the
+	// column is already present, and we must not silently ignore errors like we do nowhere else in this function.
+	rows, rowsErr := b.SqlDB.Query("PRAGMA table_info(conversations)")
+	if rowsErr == nil {
+		defer rows.Close()
+		userNameColExists := false
+		for rows.Next() {
+			var cid int
+			var name, colType string
+			var notNull int
+			var defVal sql.NullString
+			var pk int
+			if rows.Scan(&cid, &name, &colType, &notNull, &defVal, &pk) == nil && name == "user_name" {
+				userNameColExists = true
+				break
+			}
+		}
+		if rows.Err() != nil {
+			log.Warn().Err(rows.Err()).Msg("dailySummary migration: failed to scan PRAGMA table_info(conversations)")
+		} else if !userNameColExists {
+			_, altErr := b.SqlDB.Exec("ALTER TABLE conversations ADD COLUMN user_name TEXT")
+			if altErr != nil {
+				log.Warn().Err(altErr).Msg("dailySummary migration: failed to add user_name column (may already exist)")
+			}
+		}
+	} else {
+		log.Warn().Err(rowsErr).Msg("dailySummary migration: failed to query PRAGMA table_info(conversations)")
+	}
+
 	_, err = b.SqlDB.Exec(createMessagesTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create messages table: %w", err)
