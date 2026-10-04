@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"whatsapp-gpt-bot/types"
@@ -15,10 +17,14 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// errClientSide marks failures caused by the request itself rather than by the
+// provider. Errors wrapping it never count toward the circuit breaker.
+var errClientSide = errors.New("client-side error")
+
 const (
-	GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1/models/"
-	OPENAI_API_BASE = "https://api.openai.org/v1/"
-	GROQ_API_BASE   = "https://api.groq.com/openai/v1/"
+	GEMINI_API_BASE     = "https://generativelanguage.googleapis.com/v1/models/"
+	OPENAI_API_BASE     = "https://api.openai.org/v1/"
+	GROQ_API_BASE       = "https://api.groq.com/openai/v1/"
 	OPENROUTER_API_BASE = "https://openrouter.ai/api/v1/"
 )
 
@@ -66,6 +72,212 @@ func selectProvider() Provider {
 		return &geminiProvider{}
 	}
 	return nil
+}
+
+// ---------- provider fallback + circuit breaker ----------
+
+// breaker tracks consecutive failures per provider so a persistently broken
+// provider is skipped rather than retried on every single request.
+type breaker struct {
+	mu        sync.Mutex
+	failures  map[string]int
+	openUntil map[string]time.Time
+}
+
+// isProviderFault reports whether an error indicates a problem with the
+// provider itself (outage, rate limit, server error) as opposed to a client-side
+// problem (bad request, unsupported media, malformed prompt).
+//
+// Only provider faults should count toward the circuit breaker. Counting client
+// errors would penalise a healthy provider for a fault that every provider would
+// hit identically, tripping the breaker on requests that were never going to
+// succeed anywhere.
+func isProviderFault(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Local pre-flight refusals are never the provider's fault.
+	if errors.Is(err, errClientSide) {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	// Explicitly client-side: the request itself was wrong.
+	clientSignals := []string{
+		"status 400", "status 401", "status 403", "status 404", "status 422",
+		"invalid_request", "invalid request", "unsupported media", "context length",
+		"maximum context", "too many tokens", "invalid api key",
+		"content policy", "content_policy", "moderation",
+	}
+	for _, s := range clientSignals {
+		if strings.Contains(msg, s) {
+			return false
+		}
+	}
+
+	// Provider-side: transient or server faults worth counting.
+	providerSignals := []string{
+		"status 429", "status 500", "status 502", "status 503", "status 504",
+		"rate limit", "rate_limit", "rate-limited", "too many requests",
+		"overloaded", "timeout", "deadline exceeded", "connection refused",
+		"connection reset", "no such host", "temporary failure",
+		"eof", "unavailable", "internal server error", "bad gateway",
+		"service unavailable", "gateway timeout",
+	}
+	for _, s := range providerSignals {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+
+	// Unknown errors count as provider faults: the breaker is a safety valve, and
+	// an unrecognised failure is more likely transient than a persistent client bug.
+	return true
+}
+
+var providerBreaker = &breaker{
+	failures:  make(map[string]int),
+	openUntil: make(map[string]time.Time),
+}
+
+const (
+	breakerThreshold = 3               // consecutive failures before opening
+	breakerCooldown  = 2 * time.Minute // how long to skip a tripped provider
+)
+
+// allow reports whether a provider may be attempted right now.
+func (b *breaker) allow(name string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if until, ok := b.openUntil[name]; ok {
+		if time.Now().Before(until) {
+			return false
+		}
+		// cooldown elapsed — half-open: allow one probe
+		delete(b.openUntil, name)
+		delete(b.failures, name)
+	}
+	return true
+}
+
+// recordSuccess resets a provider's failure count.
+func (b *breaker) recordSuccess(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.failures, name)
+	delete(b.openUntil, name)
+}
+
+// recordFailure increments failures and trips the breaker at the threshold.
+func (b *breaker) recordFailure(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failures[name]++
+	if b.failures[name] >= breakerThreshold {
+		b.openUntil[name] = time.Now().Add(breakerCooldown)
+		log.Warn().Str("provider", name).Int("failures", b.failures[name]).
+			Msg("Circuit breaker tripped; skipping provider during cooldown")
+	}
+}
+
+// breakerSnapshot reports which providers are currently tripped (for alerting).
+func (b *breaker) trippedProviders() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	var out []string
+	for name, until := range b.openUntil {
+		if now.Before(until) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// textProviders returns the ordered list of text providers to try, skipping any
+// whose breaker is open. The explicit AI_PROVIDER override is tried first.
+func textProviders() []Provider {
+	var candidates []Provider
+
+	if override := strings.ToLower(os.Getenv("AI_PROVIDER")); override != "" {
+		switch override {
+		case "local", "lmstudio":
+			candidates = append(candidates, &localProvider{})
+		case "openrouter":
+			candidates = append(candidates, &openRouterProvider{})
+		case "openai":
+			candidates = append(candidates, &openaiProvider{})
+		case "gemini":
+			candidates = append(candidates, &geminiProvider{})
+		case "groq":
+			candidates = append(candidates, &groqProvider{})
+		}
+	}
+
+	// Secondary providers, ordered by speed/cost.
+	if os.Getenv("GROQ_API_KEY") != "" {
+		candidates = append(candidates, &groqProvider{})
+	}
+	if os.Getenv("OPENAI_API_KEY") != "" {
+		candidates = append(candidates, &openaiProvider{})
+	}
+	if os.Getenv("GEMINI_API_KEY") != "" {
+		candidates = append(candidates, &geminiProvider{})
+	}
+	if os.Getenv("OPENROUTER_ENABLED") == "true" {
+		candidates = append(candidates, &openRouterProvider{})
+	}
+	if os.Getenv("AI_ENDPOINT") != "" {
+		candidates = append(candidates, &localProvider{})
+	}
+
+	// Dedupe by name (the override may repeat a secondary provider) and filter
+	// out anything whose breaker is currently open.
+	seen := make(map[string]bool)
+	var out []Provider
+	for _, p := range candidates {
+		name := p.Name()
+		if seen[name] || !providerBreaker.allow(name) {
+			continue
+		}
+		seen[name] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// generateWithFallback tries each available text provider in order, returning the
+// first success. This is what keeps the bot answering when the primary provider
+// is rate-limited or down — previously a single provider failure failed the request.
+func generateWithFallback(ctx context.Context, prompt string, timeout time.Duration) (string, int, time.Duration, error) {
+	providers := textProviders()
+	if len(providers) == 0 {
+		return "", 0, 0, fmt.Errorf("no AI provider available (all tripped or unconfigured)")
+	}
+
+	var lastErr error
+	start := time.Now()
+	for _, p := range providers {
+		res, tokens, latency, err := p.Generate(ctx, prompt, nil, "", timeout)
+		if err == nil && strings.TrimSpace(res) != "" {
+			providerBreaker.recordSuccess(p.Name())
+			return res, tokens, latency, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("provider returned empty response")
+		}
+		lastErr = err
+		if isProviderFault(err) {
+			providerBreaker.recordFailure(p.Name())
+		} else {
+			log.Warn().Err(err).Str("provider", p.Name()).
+				Msg("Provider error classified as client-side; not counting toward circuit breaker")
+		}
+		log.Warn().Err(err).Str("provider", p.Name()).Msg("Provider failed; trying next")
+	}
+
+	return "", 0, time.Since(start), fmt.Errorf("all providers failed, last error: %w", lastErr)
 }
 
 // whisperLocalProvider uses a local whisper.cpp server or CLI for transcription
@@ -177,7 +389,7 @@ func isRateLimitError(err error, body []byte) bool {
 	return false
 }
 
-func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType string, timeout time.Duration) (string, int, time.Duration, error) {
+func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType string, _ time.Duration) (string, int, time.Duration, error) {
 	endpoint := os.Getenv("LMSTUDIO_ENDPOINT")
 	modelName := os.Getenv("LMSTUDIO_MODEL")
 	if endpoint == "" {
@@ -285,6 +497,12 @@ func callOpenRouter(ctx context.Context, prompt string, mediaData []byte, mimeTy
 				}},
 			},
 		}
+	} else if len(mediaData) > 0 {
+		// Non-image media (e.g. audio). This provider cannot forward it, and
+		// silently sending the prompt alone would make the model answer as if no
+		// media had been attached. Fail so the caller tries a provider that can
+		// handle it, or reports the failure honestly.
+		return "", 0, 0, fmt.Errorf("openrouter: unsupported media type %q (%d bytes); refusing to send text-only: %w", mimeType, len(mediaData), errClientSide)
 	} else {
 		body = map[string]interface{}{
 			"model":    modelName,

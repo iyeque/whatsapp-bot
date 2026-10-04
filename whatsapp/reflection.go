@@ -6,8 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"whatsapp-gpt-bot/ai"
 	"github.com/rs/zerolog/log"
+
+	"whatsapp-gpt-bot/ai"
 )
 
 // Reflect analyzes Max's recent messages and updates soul.md if necessary.
@@ -17,7 +18,7 @@ func (b *Bot) Reflect() {
 	var history strings.Builder
 	for _, msg := range b.conversations[b.humanAssistantJID].Messages {
 		if msg.Role == "user" {
-			history.WriteString(msg.Content + "\n")
+			fmt.Fprintf(&history, "%s\n", msg.Content)
 		}
 	}
 	b.mutex.RUnlock()
@@ -60,7 +61,7 @@ Provide the updated content for soul.md, or "NO_CHANGE". Respond ONLY with the c
 
 	// Backup current soul
 	os.WriteFile("soul.md.bak", soulContent, 0644)
-	
+
 	// Update soul
 	err = os.WriteFile("soul.md", []byte(response), 0644)
 	if err != nil {

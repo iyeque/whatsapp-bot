@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"whatsapp-gpt-bot/cache"
@@ -34,6 +35,52 @@ type VectorStore struct {
 	documents       map[string]Document
 	UserPersonality map[string]string // Maps user IDs to their personality profiles
 	queryCache      *cache.Cache
+	mu              sync.RWMutex // guards documents; reload goroutine writes while request path reads
+}
+
+// GetDocument returns a copy of a loaded document and whether it exists.
+// Safe for concurrent use with ReloadDocuments.
+func (vs *VectorStore) GetDocument(name string) (Document, bool) {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	doc, ok := vs.documents[name]
+	return doc, ok
+}
+
+// setDocument stores a document under the write lock.
+func (vs *VectorStore) setDocument(name string, doc Document) {
+	vs.mu.Lock()
+	vs.documents[name] = doc
+	vs.mu.Unlock()
+}
+
+// ReloadDocuments re-reads the persona documents from disk, replacing the
+// in-memory copies. Called by the file poller when a source file's mtime
+// advances, so edits to soul.md/identity.md/personality.md take effect without
+// restarting the bot. The embedding cache self-invalidates on mtime, so a
+// changed source file is re-embedded; unchanged files reload cheaply.
+func (vs *VectorStore) ReloadDocuments(files map[string]string) []string {
+	var reloaded []string
+	for filename, docType := range files {
+		info, err := os.Stat(filename)
+		if err != nil {
+			continue
+		}
+		// Skip files whose loaded copy is already current.
+		vs.mu.RLock()
+		existing, ok := vs.documents[filename]
+		vs.mu.RUnlock()
+		if ok && !info.ModTime().After(existing.CreatedAt) {
+			continue
+		}
+		if err := vs.loadDocument(filename, docType); err != nil {
+			log.Warn().Err(err).Str("file", filename).Msg("hot reload: failed to reload document")
+			continue
+		}
+		reloaded = append(reloaded, filename)
+		log.Info().Str("file", filename).Msg("hot reload: persona document refreshed")
+	}
+	return reloaded
 }
 
 func NewVectorStore() (*VectorStore, error) {
@@ -408,13 +455,13 @@ func (vs *VectorStore) retrieveContext(query string, userID string) (string, err
 	// 1. Include user-specific personality if known
 	if personalityProfile, exists := vs.UserPersonality[userID]; exists {
 		relevantContext.WriteString("## Information about the User you are talking to:\n")
-		relevantContext.WriteString("The user has this personality profile: " + personalityProfile + "\n\n")
+		fmt.Fprintf(&relevantContext, "The user has this personality profile: %s\n\n", personalityProfile)
 	}
 
 	// Check query cache first
 	key := sha256.Sum256([]byte(query))
 	cacheKey := hex.EncodeToString(key[:])
-	
+
 	var queryEmbedding []float32
 	var err error
 
@@ -588,7 +635,7 @@ func (vs *VectorStore) InterpretPersonalityTest(testType string, answers string)
 		// But first, try the "1. A" format
 		responses := strings.ToUpper(answers)
 		answerMap := make(map[int]rune)
-		
+
 		// Method 1: Look for "1.A" style
 		for i := 1; i <= 4; i++ {
 			prefix := fmt.Sprintf("%d.", i)

@@ -71,17 +71,27 @@ func MakeAIRequest(prompt string, mediaData []byte, mimeType string, timeout tim
 		}
 	}
 
-	// Use the selected provider (Gemini or Local)
-	p = selectProvider()
-	if p == nil {
-		return "", 0, 0, fmt.Errorf("no AI provider available")
+	// Text request: try every available provider in order, so one rate-limited or
+	// down provider no longer fails the whole request.
+	if len(mediaData) == 0 {
+		return generateWithFallback(ctx, prompt, timeout)
 	}
 
-	log.Debug().
-		Str("provider", p.Name()).
-		Int("media_len", len(mediaData)).
-		Str("mime_type", mimeType).
-		Msg("Making AI request")
+	// Media request that exhausted every media-capable provider. Do NOT fall
+	// through to a text-only request: the media payload would be silently
+	// dropped and the model would answer as if the user had sent no image or
+	// voice note, inventing a response to content it never received. Surface the
+	// failure instead so the caller can tell the user.
+	if err == nil {
+		err = fmt.Errorf("no media-capable provider configured: %w", errClientSide)
+	}
+	log.Error().Err(err).Str("mime", mimeType).Int("bytes", len(mediaData)).
+		Msg("All media-capable providers failed; refusing text-only fallback")
+	return "", 0, latency, fmt.Errorf("media processing failed (%s, %d bytes): %w", mimeType, len(mediaData), err)
+}
 
-	return p.Generate(ctx, prompt, mediaData, mimeType, timeout)
+// TrippedProviders reports providers currently skipped by the circuit breaker,
+// so the bot layer can escalate a sustained outage to the operator.
+func TrippedProviders() []string {
+	return providerBreaker.trippedProviders()
 }

@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"regexp"
 	"time"
 
 	"github.com/ledongthuc/pdf"
@@ -41,6 +41,7 @@ type BotMessage struct {
 	Role    string
 	Content string
 	Time    time.Time
+	Sender  string // actual sender name for this message (for correct history attribution)
 }
 
 type Conversation struct {
@@ -71,49 +72,56 @@ type CachedResponse struct {
 }
 
 type Bot struct {
-	client            *whatsmeow.Client
-	db                *sqlstore.Container
-	SqlDB             *sql.DB
-	conversations     map[string]*Conversation
-	cache             *cache.Cache
-	timeouts          *TimeoutManager
-	messageQueue      *queue.Queue
-	mutex             sync.RWMutex
-	qrMux             sync.Mutex
-	rateLimiter       *RateLimiter
-	vectorStore       *VectorStore // Shared RAG and personality store
-	accountManager    *AccountManager
-	botID             string
-	humanAssistantJID string // JID of the human assistant
-	lastAck           map[string]time.Time
-	ackCooldown       time.Duration
-	ignoredChatJIDs   map[string]bool      // JIDs of chats to ignore
-	mutedUntil        map[string]time.Time // Chats where Max took the wheel
-	consecutiveFailures map[string]int      // Track consecutive AI failures per chat
-	cron              *cron.Cron           // Scheduler for automated tasks
-	cronJobIDs        map[int]cron.EntryID // Map of DB task IDs to cron entry IDs
+	client              *whatsmeow.Client
+	db                  *sqlstore.Container
+	SqlDB               *sql.DB
+	conversations       map[string]*Conversation
+	cache               *cache.Cache
+	timeouts            *TimeoutManager
+	messageQueue        *queue.Queue
+	mutex               sync.RWMutex
+	qrMux               sync.Mutex
+	rateLimiter         *RateLimiter
+	vectorStore         *VectorStore // Shared RAG and personality store
+	accountManager      *AccountManager
+	botID               string
+	humanAssistantJID   string // JID of the human assistant
+	lastAck             map[string]time.Time
+	ackCooldown         time.Duration
+	ignoredChatJIDs     map[string]bool      // JIDs of chats to ignore
+	mutedUntil          map[string]time.Time // Chats where Max took the wheel
+	consecutiveFailures map[string]int       // Track consecutive AI failures per chat
+	groupEngage         bool                 // respond in groups at all (default false)
+	groupAllowlist      map[string]bool      // group JIDs allowed to engage (empty + groupEngage = all groups)
+	lastOutageAlert     time.Time            // rate-limit for global outage alerts
+	contactMu           sync.RWMutex         // guards contactIdx
+	contactIdx          *contactIndex        // cached contact lookup index
+	tools               *ToolRegistry        // model-callable capabilities
+	cron                *cron.Cron           // Scheduler for automated tasks
+	cronJobIDs          map[int]cron.EntryID // Map of DB task IDs to cron entry IDs
 }
 
 func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager, id string) (*Bot, error) {
 	bot := &Bot{
-		client:          client,
-		db:              db,
-		SqlDB:           am.SqlDB,
-		conversations:   make(map[string]*Conversation),
-		cache:           cache.NewCache(1000),
-		timeouts:        &TimeoutManager{},
-		messageQueue:    queue.NewQueue(10, 5, 5*time.Second),
-		rateLimiter:     NewRateLimiter(0.5, 5), // Allow 1 request every 2 seconds, with a burst of 5
-		accountManager:  am,
-		botID:           id,
-		vectorStore:     am.vectorStore,
-		lastAck:         make(map[string]time.Time),
-		ackCooldown:     60 * time.Second,
-		ignoredChatJIDs: make(map[string]bool),
-		mutedUntil:      make(map[string]time.Time),
+		client:              client,
+		db:                  db,
+		SqlDB:               am.SqlDB,
+		conversations:       make(map[string]*Conversation),
+		cache:               cache.NewCache(1000),
+		timeouts:            &TimeoutManager{},
+		messageQueue:        queue.NewQueue(10, 5, 5*time.Second),
+		rateLimiter:         NewRateLimiter(0.5, 5), // Allow 1 request every 2 seconds, with a burst of 5
+		accountManager:      am,
+		botID:               id,
+		vectorStore:         am.vectorStore,
+		lastAck:             make(map[string]time.Time),
+		ackCooldown:         60 * time.Second,
+		ignoredChatJIDs:     make(map[string]bool),
+		mutedUntil:          make(map[string]time.Time),
 		consecutiveFailures: make(map[string]int),
-		cron:            cron.New(),
-		cronJobIDs:      make(map[int]cron.EntryID),
+		groupAllowlist:      make(map[string]bool),
+		cron:                cron.New(),
+		cronJobIDs:          make(map[int]cron.EntryID),
 	}
 	bot.cron.Start()
 
@@ -133,6 +141,18 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 		}
 	}
 
+	// Group engagement policy. Groups are OFF by default (a shared group chat
+	// conflates multiple people into one conversation). Set GROUP_ENGAGE=true to
+	// allow responses, and GROUP_ALLOWLIST=<jid,jid> to restrict which groups.
+	bot.groupEngage = strings.EqualFold(os.Getenv("GROUP_ENGAGE"), "true")
+	if list := os.Getenv("GROUP_ALLOWLIST"); list != "" {
+		for _, jid := range strings.Split(list, ",") {
+			if trimmed := strings.TrimSpace(jid); trimmed != "" {
+				bot.groupAllowlist[trimmed] = true
+			}
+		}
+	}
+
 	humanAssistantJID := os.Getenv("HUMAN_ASSISTANT_JID")
 	if humanAssistantJID == "" {
 		return nil, fmt.Errorf("HUMAN_ASSISTANT_JID environment variable not set")
@@ -142,6 +162,15 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 	if err := bot.initDBSchema(); err != nil {
 		return nil, fmt.Errorf("failed to initialize DB schema: %w", err)
 	}
+
+	// Migrate the previously hardcoded identities into the contacts table.
+	// Must run AFTER initDBSchema, which creates the contacts table.
+	if err := bot.seedContactsFromEnv(); err != nil {
+		log.Warn().Err(err).Msg("Failed to seed contacts from environment")
+	}
+
+	// Register model-callable tools (permission-tiered).
+	bot.registerTools()
 
 	if err := bot.loadConversationsFromDB(); err != nil {
 		return nil, fmt.Errorf("failed to load conversations from DB: %w", err)
@@ -158,6 +187,21 @@ func NewBot(client *whatsmeow.Client, db *sqlstore.Container, am *AccountManager
 
 	// Start cache cleanup routine
 	go bot.cleanupCache()
+
+	// Enable reminder tag handling (1-minute check cron + AI tag interception)
+	bot.enableReminderTagHandling()
+
+	// Enable task/note tag handling (load persisted items, no cron needed)
+	bot.enableTaskNoteTagHandling()
+
+	// Enable hourly implicit preference learning
+	bot.enablePreferenceLearning()
+
+	// Hot-reload persona docs when edited on disk
+	bot.enablePersonaHotReload()
+
+	// Structured end-of-thread recaps
+	bot.enableRecapScheduler()
 
 	return bot, nil
 }
@@ -294,9 +338,21 @@ func (b *Bot) handleMessage(evt interface{}) {
 			case strings.HasPrefix(lowerMsg, "!fact"):
 				if isMax {
 					fact := strings.TrimSpace(strings.TrimPrefix(msgText, "!fact"))
-					if fact != "" {
+					// "!fact about <name> <fact>" targets a specific person;
+					// plain "!fact <fact>" appends to Max's own truth journal.
+					if strings.HasPrefix(strings.ToLower(fact), "about ") {
+						b.handleFactAboutCommand(v.Info.Chat, fact)
+					} else if fact != "" {
 						b.handleFactCommand(v.Info.Chat, fact)
 					}
+				}
+				return
+			case lowerMsg == "!facts" || strings.HasPrefix(lowerMsg, "!facts "):
+				b.listFacts(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!facts")))
+				return
+			case lowerMsg == "!contact" || strings.HasPrefix(lowerMsg, "!contact "):
+				if isMax {
+					b.handleContactCommand(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!contact")))
 				}
 				return
 			case strings.HasPrefix(lowerMsg, "!correct"):
@@ -310,6 +366,33 @@ func (b *Bot) handleMessage(evt interface{}) {
 				return
 			case strings.HasPrefix(lowerMsg, "!unschedule") || strings.HasPrefix(lowerMsg, "!remove schedule"):
 				b.handleUnscheduleCommand(v.Info.Chat, msgText)
+				return
+			case strings.HasPrefix(lowerMsg, "!reminders") || lowerMsg == "!r":
+				b.remindCommand(v.Info.Chat, msgText)
+				return
+			case strings.HasPrefix(lowerMsg, "!remind "):
+				// !remind <specification> — create a reminder
+				spec := strings.TrimSpace(strings.TrimPrefix(msgText, "!remind "))
+				if spec != "" {
+					b.handleReminderCommand(v.Info.Chat, spec)
+				} else {
+					b.sendAcknowledgment(v.Info.Chat, "Usage: !remind [in 20 minutes|at 3pm|on 2026-09-25 at 3pm] to <action> [directly]")
+				}
+				return
+			case lowerMsg == "!task" || strings.HasPrefix(lowerMsg, "!task "):
+				b.handleTaskCommand(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!task")))
+				return
+			case lowerMsg == "!todo" || lowerMsg == "!todos" || lowerMsg == "!mytasks":
+				b.listTasks(v.Info.Chat)
+				return
+			case strings.HasPrefix(lowerMsg, "!done "):
+				b.markTaskDone(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!done ")))
+				return
+			case lowerMsg == "!note" || strings.HasPrefix(lowerMsg, "!note "):
+				b.handleNoteCommand(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!note")))
+				return
+			case lowerMsg == "!notes" || strings.HasPrefix(lowerMsg, "!notes "):
+				b.listNotes(v.Info.Chat, strings.TrimSpace(strings.TrimPrefix(msgText, "!notes")))
 				return
 			}
 		}
@@ -356,7 +439,7 @@ func (b *Bot) handleMessage(evt interface{}) {
 			// Save Max's message to history so the bot knows what was said manually
 			if userMsg != "" {
 				if err := b.initConversation(chatID); err == nil {
-					msg := BotMessage{Role: "assistant", Content: userMsg, Time: v.Info.Timestamp}
+					msg := BotMessage{Role: "assistant", Content: userMsg, Time: v.Info.Timestamp, Sender: "maximus"}
 					b.mutex.Lock()
 					b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, msg)
 					b.saveMessageToDB(chatID, msg)
@@ -381,8 +464,14 @@ func (b *Bot) handleMessage(evt interface{}) {
 			return // Never respond to our own messages
 		}
 
-		// Main filter logic for incoming messages from others
-		if v.Info.IsGroup || v.Message.GetPollUpdateMessage() != nil {
+		// Main filter logic for incoming messages from others.
+		// Poll updates are always ignored. Groups are ignored unless the group
+		// engagement policy explicitly allows this chat (default: off).
+		if v.Message.GetPollUpdateMessage() != nil {
+			return
+		}
+		if v.Info.IsGroup && !b.shouldEngageGroup(v.Info.Chat.String()) {
+			log.Debug().Msgf("Ignoring group message from %s (group engagement disabled).", v.Info.Chat)
 			return
 		}
 
@@ -398,7 +487,7 @@ func (b *Bot) handleMessage(evt interface{}) {
 			if err := b.initConversation(chatID); err == nil {
 				userMsg := v.Message.GetConversation()
 				if userMsg != "" {
-					msg := BotMessage{Role: "user", Content: userMsg, Time: v.Info.Timestamp}
+					msg := BotMessage{Role: "user", Content: userMsg, Time: v.Info.Timestamp, Sender: b.resolveSenderName(v.Info.Sender.String())}
 					b.mutex.Lock()
 					b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, msg)
 					b.saveMessageToDB(chatID, msg)
@@ -564,21 +653,22 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 		LastMessageTimestamp: lastMessageTimestamp,
 	}
 
-	msgRows, err := b.SqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
+	msgRows, err := b.SqlDB.Query("SELECT role, content, sender, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages for chat %s: %w", chatID, err)
 	}
 	defer msgRows.Close()
 
 	for msgRows.Next() {
-		var role, content string
+		var role, content, sender string
 		var msgTimestamp time.Time
-		if err := msgRows.Scan(&role, &content, &msgTimestamp); err != nil {
+		if err := msgRows.Scan(&role, &content, &sender, &msgTimestamp); err != nil {
 			return nil, fmt.Errorf("failed to scan message for chat %s: %w", chatID, err)
 		}
 		conv.Messages = append(conv.Messages, BotMessage{
 			Role:    role,
 			Content: content,
+			Sender:  sender,
 			Time:    msgTimestamp,
 		})
 	}
@@ -587,6 +677,19 @@ func (b *Bot) loadConversationFromDB(chatID string) (*Conversation, error) {
 	}
 
 	return conv, nil
+}
+
+// resolveSenderName returns the display name for a sender JID.
+// Identity comes from the contacts table; the owner is recognised even if the
+// contacts row is absent.
+func (b *Bot) resolveSenderName(senderJID string) string {
+	if b.humanAssistantJID != "" && baseNumber(senderJID) == baseNumber(b.humanAssistantJID) {
+		return "Max"
+	}
+	if c, ok := b.lookupContactByJID(senderJID); ok && c.Name != "" {
+		return c.Name
+	}
+	return "User"
 }
 
 // CleanResponse strips all [REACT], [SEARCH], and [VOICE] tags from a string.
@@ -627,6 +730,24 @@ func CleanResponse(text string) string {
 	// 3. Strip [VOICE] tag
 	text = strings.ReplaceAll(text, "[VOICE]", "")
 
+	// 4. Strip any residual action tags ([TASK:...], [NOTE:...], [REMINDER:...]) that
+	//    weren't consumed by their interceptors, so raw tags never reach the user.
+	for _, marker := range []string{"[task", "[note", "[reminder", "[fact"} {
+		for {
+			lower := strings.ToLower(text)
+			idx := strings.Index(lower, marker)
+			if idx == -1 {
+				break
+			}
+			endIdx := strings.Index(text[idx:], "]")
+			if endIdx == -1 {
+				text = text[:idx] + text[idx+len(marker):]
+				continue
+			}
+			text = text[:idx] + text[idx+endIdx+1:]
+		}
+	}
+
 	return strings.TrimSpace(text)
 }
 
@@ -634,8 +755,17 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	start := time.Now()
 	utils.IncrementRequests()
 
-	// Get user ID from the chat ID for personalization
+	// Get user ID from the chat ID for personalization.
+	// In a group, the chat JID identifies the GROUP, not the person — using it
+	// would conflate every participant into one identity. Resolve the individual
+	// participant instead so names and memory stay per-person.
 	userID := chatID
+	if msg.Info.IsGroup {
+		userID = msg.Info.Sender.String()
+		if userID == "" && !msg.Info.SenderAlt.IsEmpty() {
+			userID = msg.Info.SenderAlt.String()
+		}
+	}
 
 	var userName string
 	var isMax bool
@@ -645,21 +775,35 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	userName = "User"
 	isMax = false
 	isFamily = false
-	baseHumanJID := strings.Split(b.humanAssistantJID, "@")[0]
-	if userID == b.humanAssistantJID || strings.HasPrefix(userID, baseHumanJID) {
+
+	// Identity + tier resolution. The contacts table is the single source of
+	// truth; isMax and isFamily are derived from the resolved tier rather than
+	// from hardcoded address fragments.
+	if msg.Info.IsGroup && msg.Info.PushName != "" {
+		userName = msg.Info.PushName
+	}
+
+	tier := b.tierForJID(userID)
+	switch {
+	case tier == TierOwner:
 		userName = "Max"
 		isMax = true
-	} else if strings.Contains(userID, "97375716663491") {
-		userName = "Wilma"
 		isFamily = true
-	} else if strings.Contains(userID, "76420520931421") {
-		userName = "Stephanie"
+	case tier == TierFamily:
+		// Prefer the canonical contact name; fall back to push name in groups.
+		if c, ok := b.lookupContactByJID(userID); ok && c.Name != "" {
+			userName = c.Name
+		}
 		isFamily = true
-	} else if strings.Contains(strings.ToLower(msg.Info.PushName), "nicki") {
-		userName = "Nicki"
-		isFamily = true // Identified as sister in previous context
-	} else if msg.Info.PushName != "" {
-		userName = msg.Info.PushName
+	case tier == TierKnown:
+		if c, ok := b.lookupContactByJID(userID); ok && c.Name != "" {
+			userName = c.Name
+		}
+	default:
+		// Unknown: use whatever name WhatsApp gave us, if anything.
+		if msg.Info.PushName != "" {
+			userName = msg.Info.PushName
+		}
 	}
 
 	// Persist the resolved user name on the conversation (for daily summary, etc.).
@@ -695,6 +839,7 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		Role:    "user",
 		Content: userMsg,
 		Time:    time.Now(),
+		Sender:  userName,
 	}
 	b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, userMessage)
 	if err := b.saveMessageToDB(chatID, userMessage); err != nil {
@@ -731,6 +876,7 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 			Role:    "assistant",
 			Content: introMsg,
 			Time:    time.Now(),
+			Sender:  "maximus",
 		}
 		b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, assistantMessage)
 		b.mutex.Unlock()
@@ -848,11 +994,13 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		startIdx = len(convForPrompt.Messages) - 12
 	}
 	for _, message := range convForPrompt.Messages[startIdx:] {
-		sender := message.Role
-		if sender == "user" {
-			sender = userName
-		} else {
-			sender = "maximus"
+		sender := message.Sender
+		if sender == "" {
+			if message.Role == "user" {
+				sender = userName
+			} else {
+				sender = "maximus"
+			}
 		}
 		// Clean history from tags to prevent re-triggering and hallucinations
 		cleanContent := CleanResponse(message.Content)
@@ -867,6 +1015,21 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		archivedSection = fmt.Sprintf("\n### PRIOR CONVERSATION CONTEXT (AWARENESS ONLY — DO NOT MENTION OR REFER TO):\n%s\n*You are aware of this prior context. Do NOT bring up old topics from it unless %s explicitly asks about them. Start fresh based only on the Recent History below.*\n", convForPrompt.Summary, userName)
 	}
 
+	// Read back stored notes + open tasks for this contact so [NOTE:]/[TASK:] are not write-only.
+	memorySection := b.buildContactMemorySection(chatID)
+
+	// Inject implicitly-learned preferences so tone calibrates per contact.
+	profileSection := b.buildProfileSection(chatID)
+
+	// Inject structured recaps from earlier threads for cross-thread continuity.
+	recapSection := b.buildRecapSection(chatID)
+
+	// Inject facts about people so the bot knows more than just Max's own life.
+	factsSection := b.buildFactsSection(chatID, userName)
+
+	// Inject the contact roster so the model uses canonical names when acting.
+	contactsSection := b.contactsForPrompt()
+
 	var roleInstruction string
 	var botPersona string
 
@@ -874,10 +1037,10 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 	identityDoc := ""
 	personalityDoc := ""
 	truthDoc := ""
-	if doc, ok := b.vectorStore.documents["identity.md"]; ok {
+	if doc, ok := b.vectorStore.GetDocument("identity.md"); ok {
 		identityDoc = doc.Text
 	}
-	if doc, ok := b.vectorStore.documents["personality.md"]; ok {
+	if doc, ok := b.vectorStore.GetDocument("personality.md"); ok {
 		personalityDoc = doc.Text
 	}
 	if data, err := os.ReadFile("truth.md"); err == nil {
@@ -891,10 +1054,10 @@ func (b *Bot) handleTextMessage(msg *events.Message, chatID string) {
 		// When talking to others, the persona is Max's personality
 		botPersona = personalityDoc + "\n\n### TRUTH JOURNAL (PRIORITY FACTS):\n" + truthDoc
 		roleInstruction = fmt.Sprintf("You are maximus. In this conversation, you are speaking on behalf of Max as his digital twin. Speak naturally, warmly, and concisely. You may use 'I', 'me', 'my' when reflecting Max's own experiences or actions, but DO NOT attribute Max's personal details, relationships, or life story to %s. Keep the conversation centered on what %s actually says or asks about.", userName, userName)
-		if isFamily && userName == "Wilma" {
-			roleInstruction += " You are talking to your wife, Wilma. Be affectionate and natural, but remember you are also her digital assistant ('maximus') helping her with tasks. Stay focused on her current requests and do NOT hallucinate unrelated personal details unless she brings them up."
-		} else if isFamily && (userName == "Stephanie" || userName == "Nicki") {
-			roleInstruction += fmt.Sprintf(" You are talking to your sister, %s. Be natural as a brother would be. Stay chill and do NOT make up stories or plans.", userName)
+		if isDepthConversation(historyMessages) {
+			roleInstruction += " THE USER IS HAVING A DEEP, MEANINGFUL CONVERSATION — you may write longer, more thoughtful responses with depth and context. 3-5 sentences is appropriate when the conversation warrants it."
+		} else {
+			roleInstruction += " Keep responses short (1-3 sentences). The user prefers concise communication."
 		}
 	}
 
@@ -932,6 +1095,17 @@ You are equipped with a real-time web search tool. If you need to find informati
 To do this, include the tag [SEARCH:your search query] in your response.
 Example: "Let me check the latest news for you. [SEARCH:latest world news today]"
 The search results will be provided to you immediately. Use this to be the most informed version of yourself. Do NOT say you cannot go online; use the tool instead.
+When you use search results, ATTRIBUTE them — name the source in plain words, e.g. "according to Reuters" or "BBC is reporting". Each result includes a Source line; use the site name, never the raw URL. If the results are thin or conflicting, say so rather than presenting them as settled fact.
+
+### MEMORY & TASK TOOLS (YOUR ACTION CAPABILITY):
+You can take real actions by emitting these tags. The system intercepts them, stores the item, and strips the tag before the user sees your message — so NEVER mention the tag itself to the user, just confirm naturally in plain words.
+
+- **[REMINDER:when to what]** — schedule a reminder. Examples: "[REMINDER:at 3pm to call George]", "[REMINDER:tomorrow at 10am to email Wilma directly]". Add the word "directly" when the person asked to be messaged themselves; otherwise the reminder goes to Max.
+- **[TASK:description]** — record an action item for the person you're talking to. Example: "[TASK:send the signed contract]"
+- **[NOTE:fact]** — save a durable fact worth remembering about this person. Example: "[NOTE:Wilma prefers morning calls]"
+- **[FACT:person|fact]** — save a fact about ANY person (including people not in this chat). Example: "[FACT:Wilma|prefers morning calls]". Use this when someone tells you something worth remembering about a third party.
+
+Use these when the conversation genuinely calls for them — a stated intention, a commitment, or a fact worth keeping. Do NOT use them for small talk, and do NOT invent reminders nobody asked for. Confirm in natural language, e.g. "Got it — I'll remind you at 3."
 
 ### IMPORTANT:
 - **BE EXTREMELY CONCISE.** Avoid long paragraphs. 1-3 sentences is the sweet spot.
@@ -961,10 +1135,15 @@ The user sent this message at %s. Use this as the current moment to determine 't
 ### CONTEXT FOR THIS CHAT:
 %s
 %s
+%s
+%s
+%s
+%s
+%s
 
 ### RECENT HISTORY:
 %s
-`, roleInstruction, botPersona, userName, msg.Info.Timestamp.Format("Monday, January 2, 2006 at 3:04 PM"), retrievedCtx, archivedSection, recentHistoryStr)
+`, roleInstruction, botPersona, userName, msg.Info.Timestamp.Format("Monday, January 2, 2006 at 3:04 PM"), retrievedCtx, archivedSection, memorySection, profileSection, recapSection, factsSection, contactsSection, recentHistoryStr)
 
 	augmentedPrompt := fmt.Sprintf("%s\n\n%s: %s\nMax:", systemPrompt, userName, userMsg)
 	if isMax {
@@ -972,8 +1151,47 @@ The user sent this message at %s. Use this as the current moment to determine 't
 	}
 
 	timeout := b.timeouts.getOptimalTimeout()
-	response, tokens, latency, err := ai.MakeAIRequest(augmentedPrompt, nil, "", timeout)
 
+	// Agentic path: when a tool-capable provider is configured, run the tool loop
+	// so the model can take real actions. Falls back to plain text when no
+	// tool-capable model is available, preserving prior behaviour exactly.
+	var response string
+	var tokens int
+	var latency time.Duration
+
+	if b.tools != nil && ai.ToolsAvailable() {
+		toolCtx := ToolContext{
+			CallerJID:  userID,
+			CallerName: userName,
+			CallerTier: tier,
+			ChatID:     chatID,
+			IsGroup:    msg.Info.IsGroup,
+			RawMessage: userMsg,
+			Bot:        b,
+		}
+		sysForTools := b.buildToolSystemPrompt(systemPrompt, tier)
+		loopRes, loopErr := b.runToolLoop(context.Background(), toolCtx, sysForTools, userMsg, nil)
+		if loopErr != nil {
+			// Tool path failed — fall through to the plain-text path below rather
+			// than failing the turn, unless the plain path also fails.
+			log.Warn().Err(loopErr).Msg("Tool loop failed; falling back to plain text request")
+		} else {
+			response = loopRes.Text
+			tokens = loopRes.Tokens
+			latency = loopRes.Latency
+			if loopRes.UsedTools {
+				log.Info().
+					Strs("tools", loopRes.ToolsUsed).
+					Strs("denied", loopRes.Denied).
+					Int("rounds", loopRes.Rounds).
+					Msg("Agentic turn completed with tool use")
+			}
+		}
+	}
+
+	if response == "" {
+		response, tokens, latency, err = ai.MakeAIRequest(augmentedPrompt, nil, "", timeout)
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("Error making AI request")
 		utils.IncrementFailedRequest()
@@ -987,6 +1205,9 @@ The user sent this message at %s. Use this as the current moment to determine 't
 		if failCount >= 3 {
 			b.triggerHITLAlert(chatID, err)
 		}
+
+		// System-wide outage check: alert Max if every provider is tripped.
+		go b.checkGlobalOutage()
 
 		errorMsg := "I'm having trouble processing your request right now. Please try again."
 		if isTimeoutError(err) {
@@ -1035,6 +1256,18 @@ The user sent this message at %s. Use this as the current moment to determine 't
 
 	b.cacheResponse(userMsg, response)
 
+	// 1c. Intercept [TASK:...] tags emitted by the AI: store tasks, strip the tags.
+	response, _ = b.processAITaskTags(msg.Info.Chat, response, chatID)
+
+	// 1d. Intercept [NOTE:...] tags emitted by the AI: store notes, strip the tags.
+	response, _ = b.processAINoteTags(msg.Info.Chat, response, chatID)
+
+	// 1e. Intercept [REMINDER:...] tags emitted by the AI: schedule reminders, strip the tags.
+	response, _ = b.processAIReminderTags(msg.Info.Chat, response, chatID)
+
+	// 1f. Intercept [FACT:subject|content] tags: store knowledge about people, strip the tags.
+	response, _ = b.processAIFactTags(msg.Info.Chat, response, chatID)
+
 	// Use the new helper to process the response
 	b.processAIResponse(chatID, msg.Info.Chat, msg.Info.ID, response, tokens, latency, false)
 }
@@ -1049,12 +1282,7 @@ func (b *Bot) handleReactionMessage(msg *events.Message) {
 	senderJID := msg.Info.Sender.String()
 
 	// Identify the reactor for context
-	reactorName := "User"
-	if strings.Contains(senderJID, "97375716663491") {
-		reactorName = "Wilma"
-	} else if strings.Contains(senderJID, "76420520931421") {
-		reactorName = "Stephanie"
-	}
+	reactorName := b.resolveSenderName(senderJID)
 
 	content := fmt.Sprintf("(%s reacted with %s)", reactorName, reaction.GetText())
 	fmt.Printf("Received reaction in %s: %s\n", chatID, content)
@@ -1065,6 +1293,7 @@ func (b *Bot) handleReactionMessage(msg *events.Message) {
 			Role:    "user",
 			Content: content,
 			Time:    msg.Info.Timestamp,
+			Sender:  reactorName,
 		}
 		b.mutex.Lock()
 		b.conversations[chatID].Messages = append(b.conversations[chatID].Messages, reactionMsg)
@@ -1205,7 +1434,7 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 	prompt += "Please describe what you see in this image and respond to the user appropriately as Max."
 
 	timeout := b.timeouts.getOptimalTimeout()
-	
+
 	// Calculate hash for caching
 	h := sha256.New()
 	h.Write(data)
@@ -1214,7 +1443,7 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 	// Check cache
 	var description string
 	err = b.SqlDB.QueryRow("SELECT description FROM image_cache WHERE image_hash = ?", hash).Scan(&description)
-	
+
 	var response string
 	var tokens int
 	var latency time.Duration
@@ -1222,7 +1451,7 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 	if err != nil {
 		// Cache miss: describe it with AI
 		log.Info().Msg("New image, describing with AI.")
-		
+
 		response, tokens, latency, err = ai.MakeAIRequest(prompt, data, "image/jpeg", timeout)
 		if err != nil {
 			log.Error().Err(err).Msg("Error describing image with AI")
@@ -1248,6 +1477,7 @@ func (b *Bot) handleImageMessage(msg *events.Message) {
 			Role:    "user",
 			Content: fmt.Sprintf("[Sent an image] %s", userCaption),
 			Time:    msg.Info.Timestamp,
+			Sender:  b.resolveGroupSenderName(msg.Info),
 		})
 		b.mutex.Unlock()
 	}
@@ -1328,6 +1558,7 @@ func (b *Bot) handleDocumentMessage(msg *events.Message) {
 			Role:    "user",
 			Content: fmt.Sprintf("[Sent a document: %s]", fileName),
 			Time:    msg.Info.Timestamp,
+			Sender:  b.resolveGroupSenderName(msg.Info),
 		})
 		b.mutex.Unlock()
 	}
@@ -1511,6 +1742,7 @@ func (b *Bot) initDBSchema() error {
 		conversation_chat_id TEXT NOT NULL,
 		role TEXT NOT NULL,
 		content TEXT NOT NULL,
+		sender TEXT NOT NULL,
 		timestamp DATETIME NOT NULL,
 		FOREIGN KEY (conversation_chat_id) REFERENCES conversations(chat_id) ON DELETE CASCADE
 	);
@@ -1525,24 +1757,110 @@ func (b *Bot) initDBSchema() error {
 	`
 
 	createScheduledTasksTableSQL := `
-	CREATE TABLE IF NOT EXISTS scheduled_tasks (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		chat_id TEXT NOT NULL,
-		target_jid TEXT NOT NULL,
-		cron_expr TEXT NOT NULL,
-		instruction TEXT NOT NULL,
-		is_dynamic BOOLEAN DEFAULT 0,
-		created_at DATETIME NOT NULL
-	);
-	`
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	chat_id TEXT NOT NULL,
+	target_jid TEXT NOT NULL,
+	cron_expr TEXT NOT NULL,
+	instruction TEXT NOT NULL,
+	is_dynamic BOOLEAN DEFAULT 0,
+	created_at DATETIME NOT NULL
+);
+`
 
 	createImageCacheTableSQL := `
-	CREATE TABLE IF NOT EXISTS image_cache (
-		image_hash TEXT PRIMARY KEY,
-		description TEXT NOT NULL,
-		created_at DATETIME NOT NULL
-	);
-	`
+CREATE TABLE IF NOT EXISTS image_cache (
+	image_hash TEXT PRIMARY KEY,
+	description TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);
+`
+
+	createRemindersTableSQL := `
+CREATE TABLE IF NOT EXISTS reminders (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at DATETIME NOT NULL,
+	fire_at DATETIME NOT NULL,
+	contact_jid TEXT NOT NULL,
+	contact_name TEXT NOT NULL,
+	message TEXT NOT NULL,
+	created_by_jid TEXT NOT NULL,
+	mode TEXT NOT NULL DEFAULT 'remind_max' CHECK(mode IN ('remind_max','direct')),
+	fired INTEGER NOT NULL DEFAULT 0
+);
+`
+
+	createTasksTableSQL := `
+CREATE TABLE IF NOT EXISTS tasks (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at DATETIME NOT NULL,
+	contact_jid TEXT NOT NULL,
+	contact_name TEXT NOT NULL,
+	task TEXT NOT NULL,
+	created_by_jid TEXT NOT NULL,
+	done INTEGER NOT NULL DEFAULT 0
+);
+`
+
+	createNotesTableSQL := `
+CREATE TABLE IF NOT EXISTS notes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at DATETIME NOT NULL,
+	contact_jid TEXT NOT NULL,
+	contact_name TEXT NOT NULL,
+	note TEXT NOT NULL,
+	created_by_jid TEXT NOT NULL
+);
+`
+
+	// user_profiles stores implicitly-learned per-contact preferences (communication style,
+	// topics they care about, dislikes). Distinct from user_personalities, which holds
+	// explicit MBTI/Enneagram test results.
+	createUserProfilesTableSQL := `
+CREATE TABLE IF NOT EXISTS user_profiles (
+	user_id TEXT PRIMARY KEY,
+	display_name TEXT NOT NULL DEFAULT '',
+	communication_style TEXT NOT NULL DEFAULT '',
+	interests TEXT NOT NULL DEFAULT '',
+	dislikes TEXT NOT NULL DEFAULT '',
+	notes_summary TEXT NOT NULL DEFAULT '',
+	interaction_count INTEGER NOT NULL DEFAULT 0,
+	updated_at DATETIME NOT NULL
+);
+`
+
+	// conversation_recaps stores a structured end-of-thread digest (decisions,
+	// commitments, open questions) so future context recall is richer than a flat
+	// summary and the daily digest can surface actionable items.
+	createConversationRecapsTableSQL := `
+CREATE TABLE IF NOT EXISTS conversation_recaps (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at DATETIME NOT NULL,
+	chat_id TEXT NOT NULL,
+	contact_name TEXT NOT NULL,
+	message_count INTEGER NOT NULL DEFAULT 0,
+	summary TEXT NOT NULL DEFAULT '',
+	decisions TEXT NOT NULL DEFAULT '',
+	commitments TEXT NOT NULL DEFAULT '',
+	open_questions TEXT NOT NULL DEFAULT '',
+	sentiment TEXT NOT NULL DEFAULT ''
+);
+`
+
+	// facts stores knowledge about ANY person (not just Max), keyed by subject name.
+	// This is what lets the bot remember "Wilma prefers morning calls" when Max
+	// mentions it in his own chat, and recall it later when talking to Wilma.
+	// truth.md remains Max's personal truth journal.
+	createFactsTableSQL := `
+CREATE TABLE IF NOT EXISTS facts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at DATETIME NOT NULL,
+	subject TEXT NOT NULL,
+	fact TEXT NOT NULL,
+	created_by_jid TEXT NOT NULL,
+	UNIQUE(subject, fact)
+);
+`
 
 	_, err := b.SqlDB.Exec(createConversationsTableSQL)
 	if err != nil {
@@ -1579,6 +1897,34 @@ func (b *Bot) initDBSchema() error {
 		log.Warn().Err(rowsErr).Msg("dailySummary migration: failed to query PRAGMA table_info(conversations)")
 	}
 
+	// Migration: add sender column to messages table if it doesn't exist (existing DBs created before this column was added).
+	messageRows, messageRowsErr := b.SqlDB.Query("PRAGMA table_info(messages)")
+	if messageRowsErr == nil {
+		defer messageRows.Close()
+		senderColExists := false
+		for messageRows.Next() {
+			var cid int
+			var name, colType string
+			var notNull int
+			var defVal sql.NullString
+			var pk int
+			if messageRows.Scan(&cid, &name, &colType, &notNull, &defVal, &pk) == nil && name == "sender" {
+				senderColExists = true
+				break
+			}
+		}
+		if messageRows.Err() != nil {
+			log.Warn().Err(messageRows.Err()).Msg("migration: failed to scan PRAGMA table_info(messages)")
+		} else if !senderColExists {
+			_, altErr := b.SqlDB.Exec("ALTER TABLE messages ADD COLUMN sender TEXT NOT NULL DEFAULT 'User'")
+			if altErr != nil {
+				log.Warn().Err(altErr).Msg("migration: failed to add sender column to messages (may already exist)")
+			}
+		}
+	} else {
+		log.Warn().Err(messageRowsErr).Msg("migration: failed to query PRAGMA table_info(messages)")
+	}
+
 	_, err = b.SqlDB.Exec(createMessagesTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create messages table: %w", err)
@@ -1599,6 +1945,54 @@ func (b *Bot) initDBSchema() error {
 		return fmt.Errorf("failed to create image_cache table: %w", err)
 	}
 
+	_, err = b.SqlDB.Exec(createTasksTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create tasks table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createNotesTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create notes table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createRemindersTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create reminders table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createUserProfilesTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create user_profiles table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createConversationRecapsTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create conversation_recaps table: %w", err)
+	}
+
+	_, err = b.SqlDB.Exec(createFactsTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create facts table: %w", err)
+	}
+
+	// Contacts: identity + permission tiers. Created here so the seed step that
+	// follows can insert the owner and legacy known contacts.
+	if err := b.ensureContactsSchema(); err != nil {
+		return err
+	}
+
+	// Migration: CREATE TABLE IF NOT EXISTS is a no-op on a DB where `facts`
+	// already exists, so a UNIQUE declared only in the CREATE would be missing.
+	// A unique index is idempotent and enforces the same constraint on old tables.
+	// Dedupe existing rows first — CREATE UNIQUE INDEX fails on a table that
+	// already contains duplicates, which would leave dedupe silently unenforced.
+	if _, err := b.SqlDB.Exec("DELETE FROM facts WHERE id NOT IN (SELECT MIN(id) FROM facts GROUP BY subject, fact)"); err != nil {
+		log.Warn().Err(err).Msg("migration: failed to dedupe existing facts rows")
+	}
+	if _, err := b.SqlDB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_subject_fact ON facts(subject, fact)"); err != nil {
+		log.Warn().Err(err).Msg("migration: failed to create unique index on facts(subject, fact)")
+	}
+
 	return nil
 }
 
@@ -1617,6 +2011,9 @@ func (b *Bot) loadConversationsFromDB() error {
 			if err := pRows.Scan(&uID, &profile); err == nil {
 				b.vectorStore.UserPersonality[uID] = profile
 			}
+		}
+		if err := pRows.Err(); err != nil {
+			log.Warn().Err(err).Msg("loadConversationsFromDB: pRows iteration error")
 		}
 	}
 
@@ -1645,21 +2042,22 @@ func (b *Bot) loadConversationsFromDB() error {
 
 		// Load messages for this conversation
 		if err := func() error {
-			msgRows, err := b.SqlDB.Query("SELECT role, content, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
+			msgRows, err := b.SqlDB.Query("SELECT role, content, sender, timestamp FROM messages WHERE conversation_chat_id = ? ORDER BY timestamp ASC", chatID)
 			if err != nil {
 				return fmt.Errorf("failed to query messages for chat %s: %w", chatID, err)
 			}
 			defer msgRows.Close()
 
 			for msgRows.Next() {
-				var role, content string
+				var role, content, sender string
 				var msgTimestamp time.Time
-				if err := msgRows.Scan(&role, &content, &msgTimestamp); err != nil {
+				if err := msgRows.Scan(&role, &content, &sender, &msgTimestamp); err != nil {
 					return fmt.Errorf("failed to scan message for chat %s: %w", chatID, err)
 				}
 				conv.Messages = append(conv.Messages, BotMessage{
 					Role:    role,
 					Content: content,
+					Sender:  sender,
 					Time:    msgTimestamp,
 				})
 			}
@@ -1689,8 +2087,8 @@ func (b *Bot) saveConversationToDB(chatID string, conv *Conversation) error {
 
 func (b *Bot) saveMessageToDB(chatID string, msg BotMessage) error {
 	_, err := b.SqlDB.Exec(
-		"INSERT INTO messages (conversation_chat_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-		chatID, msg.Role, msg.Content, msg.Time,
+		"INSERT INTO messages (conversation_chat_id, role, content, sender, timestamp) VALUES (?, ?, ?, ?, ?)",
+		chatID, msg.Role, msg.Content, msg.Sender, msg.Time,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save message for chat %s to DB: %w", chatID, err)
@@ -1766,6 +2164,7 @@ func (b *Bot) processAIResponse(chatID string, chat wtypes.JID, msgID string, re
 		Role:    "assistant",
 		Content: response,
 		Time:    time.Now(),
+		Sender:  "maximus",
 	}
 	if conv, exists := b.conversations[chatID]; exists {
 		conv.Messages = append(conv.Messages, assistantMessage)
@@ -1930,7 +2329,7 @@ func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDyna
 	if isDynamic {
 		// Use AI to generate content (poems, news, weather, etc.)
 		prompt := fmt.Sprintf("You are performing a scheduled task as Max. Your instruction is: \"%s\". Please generate the appropriate content now.", instruction)
-		
+
 		// If it looks like a news/weather request, hint at searching
 		if strings.Contains(strings.ToLower(instruction), "news") || strings.Contains(strings.ToLower(instruction), "price") || strings.Contains(strings.ToLower(instruction), "weather") {
 			prompt += " You MUST use your [SEARCH:...] tool if you need current information like weather, news, or prices. Once you have the results, provide the final summary."
@@ -1973,11 +2372,11 @@ func (b *Bot) executeScheduledTask(target wtypes.JID, instruction string, isDyna
 				log.Info().Msgf("Scheduled task AI requested web search: %s", searchQuery)
 
 				searchResults, _ := utils.SearchWeb(searchQuery)
-				
-				// CRITICAL: Append the AI's previous response to the prompt 
+
+				// CRITICAL: Append the AI's previous response to the prompt
 				// so it knows it already asked for this and is now seeing results.
 				prompt += fmt.Sprintf("\n\nMaximus: %s\n\n### SEARCH RESULTS FOR \"%s\":\n%s\n\n(Now, using these results, continue your response as Max. Be concise and natural.)", response, searchQuery, searchResults)
-				
+
 				response, _, _, err = ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
 				if err != nil {
 					break
@@ -2012,7 +2411,7 @@ func (b *Bot) dailySummary() {
 	defer rows.Close()
 
 	type personEntry struct {
-		name   string
+		name     string
 		messages []string
 	}
 	persons := make(map[string]*personEntry)
@@ -2030,6 +2429,10 @@ func (b *Bot) dailySummary() {
 		)
 		if err != nil || msgRows == nil {
 			continue
+		}
+		if err := rows.Err(); err != nil {
+			log.Warn().Err(err).Msg("getDailySummary: rows iteration error")
+			break
 		}
 		// Use a closure so defer msgRows.Close() runs at end of this iteration
 		// even if the inner loop panics or exits early, preventing row-resource leaks.
@@ -2140,6 +2543,9 @@ func (b *Bot) loadScheduledTasks() error {
 			count++
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("loadScheduledTasks: rows iteration error")
+	}
 	log.Info().Msgf("Restored %d scheduled tasks from database", count)
 	return nil
 }
@@ -2147,7 +2553,7 @@ func (b *Bot) loadScheduledTasks() error {
 func (b *Bot) handleUnscheduleCommand(chat wtypes.JID, text string) {
 	parts := strings.Fields(text)
 	// format: remove schedule [id] or unschedule [id]
-	
+
 	if len(parts) < 3 && strings.HasPrefix(strings.ToLower(text), "remove schedule") {
 		// List tasks if no ID
 		b.listScheduledTasks(chat)
@@ -2203,6 +2609,9 @@ func (b *Bot) listScheduledTasks(chat wtypes.JID) {
 			builder.WriteString(fmt.Sprintf("[%d] %s -> %s (%s)\n", id, cron, target, instr))
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("listScheduledTasks: rows iteration error")
+	}
 
 	if !found {
 		b.sendAcknowledgment(chat, "No active scheduled tasks found.")
@@ -2227,19 +2636,19 @@ func (b *Bot) ResumeAutopilot() {
 func (b *Bot) handleStatusCommand(chat wtypes.JID) {
 	m := utils.GetMetrics()
 	mem := utils.GetMemoryStats()
-	
-	status := fmt.Sprintf("🤖 *Maximus Status*\n\n" +
-		"📈 *Metrics:*\n" +
-		"- Total Requests: %d\n" +
-		"- Active Sessions: %d\n" +
-		"- Avg Latency: %v\n\n" +
-		"🧠 *Memory:*\n" +
-		"- Heap Alloc: %s\n" +
-		"- Heap In-Use: %s\n" +
+
+	status := fmt.Sprintf("🤖 *Maximus Status*\n\n"+
+		"📈 *Metrics:*\n"+
+		"- Total Requests: %d\n"+
+		"- Active Sessions: %d\n"+
+		"- Avg Latency: %v\n\n"+
+		"🧠 *Memory:*\n"+
+		"- Heap Alloc: %s\n"+
+		"- Heap In-Use: %s\n"+
 		"- Goroutines: %d",
 		m.TotalRequests, m.ActiveSessions, time.Duration(m.AverageLatency),
 		formatBytes(mem.HeapAlloc), formatBytes(mem.HeapInUse), m.GoroutineCount)
-		
+
 	b.sendAcknowledgment(chat, status)
 }
 
@@ -2250,13 +2659,15 @@ func (b *Bot) handleLogsCommand(chat wtypes.JID) {
 		b.sendAcknowledgment(chat, "❌ Could not read logs.")
 		return
 	}
-	
+
 	lines := strings.Split(string(data), "\n")
 	start := len(lines) - 15
-	if start < 0 { start = 0 }
-	
+	if start < 0 {
+		start = 0
+	}
+
 	snippet := strings.Join(lines[start:], "\n")
-	b.sendAcknowledgment(chat, "📋 *Recent Logs:*\n\n" + snippet)
+	b.sendAcknowledgment(chat, "📋 *Recent Logs:*\n\n"+snippet)
 }
 
 func formatBytes(b uint64) string {
@@ -2279,12 +2690,12 @@ func (b *Bot) handleFactCommand(chat wtypes.JID, fact string) {
 		return
 	}
 	defer f.Close()
-	
+
 	if _, err := f.WriteString("- " + fact + "\n"); err != nil {
 		b.sendAcknowledgment(chat, "❌ Error writing fact.")
 		return
 	}
-	b.sendAcknowledgment(chat, "✅ Fact added to truth journal: " + fact)
+	b.sendAcknowledgment(chat, "✅ Fact added to truth journal: "+fact)
 }
 
 func (b *Bot) handleCorrectCommand(chat wtypes.JID, correction string) {
@@ -2294,13 +2705,13 @@ func (b *Bot) handleCorrectCommand(chat wtypes.JID, correction string) {
 		return
 	}
 	defer f.Close()
-	
+
 	if _, err := f.WriteString("- " + correction + "\n"); err != nil {
 		b.sendAcknowledgment(chat, "❌ Error writing correction.")
 		return
 	}
-	
-	b.sendAcknowledgment(chat, "✅ Correction noted. My apologies for the misinformation—let me clarify: " + correction)
+
+	b.sendAcknowledgment(chat, "✅ Correction noted. My apologies for the misinformation—let me clarify: "+correction)
 }
 
 // shouldEscalateToMax returns true if the user message is a request to speak with the real Max.
@@ -2351,31 +2762,1491 @@ func (b *Bot) escalateToMax(chatID string, chat wtypes.JID, userName string, use
 	}
 
 	// Reassure the user
-	reassurance := fmt.Sprintf("I've let Max know you'd like to speak with him. He'll get back to you as soon as he can. In the meantime, I'm here to help with anything else.")
+	reassurance := "I've let Max know you'd like to speak with him. He'll get back to you as soon as he can. In the meantime, I'm here to help with anything else."
 	b.sendAcknowledgment(chat, reassurance)
 }
 
 // triggerHITLAlert notifies the human assistant that the bot is stuck and pauses autopilot for that chat.
 func (b *Bot) triggerHITLAlert(chatID string, lastErr error) {
-	alertMsg := fmt.Sprintf("🚨 *MAXIMUS CRITICAL ALERT*\n\n" +
-		"Bot is stuck in chat: %s\n" +
-		"Consecutive Failures: 3\n" +
-		"Last Error: %v\n\n" +
+	alertMsg := fmt.Sprintf("🚨 *MAXIMUS CRITICAL ALERT*\n\n"+
+		"Bot is stuck in chat: %s\n"+
+		"Consecutive Failures: 3\n"+
+		"Last Error: %v\n\n"+
 		"Auto-pilot has been paused for this chat. Please intervene or use '!resume' when ready.",
 		chatID, lastErr)
-	
+
 	// Send to Max
 	targetJID, err := wtypes.ParseJID(b.humanAssistantJID)
 	if err == nil {
 		b.sendAcknowledgment(targetJID, alertMsg)
 	}
-	
+
 	// Pause bot for this chat until manual resume
 	b.mutex.Lock()
 	b.mutedUntil[chatID] = time.Now().Add(24 * time.Hour)
 	b.mutex.Unlock()
-	
+
 	log.Warn().Msgf("HITL Alert triggered for chat %s. Bot paused.", chatID)
 }
 
+// handleReminderCommand stores a reminder and delivers a confirmation. Format:
+//
+//	!remind [in N minutes|at TIME|on DATE at TIME] to <do something> [directly]
+//
+// Examples:
+//
+//	!remind in 30 minutes to call George
+//	!remind at 3pm to call George directly
+//	!remind tomorrow at 10am to email Wilma
+//	!remind 2026-09-25 15:00 to call George directly
+func (b *Bot) handleReminderCommand(chat wtypes.JID, rawText string) {
+	text := strings.TrimSpace(strings.TrimPrefix(rawText, "!remind"))
+	if text == "" {
+		b.sendAcknowledgment(chat, "Usage: !remind [in 5 minutes|at 3pm|on 2026-09-25 at 3pm] to <action> [directly]")
+		return
+	}
 
+	now := time.Now()
+	fireAt, action, mode, err := b.parseReminderText(text, now)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't parse that reminder: "+err.Error())
+		return
+	}
+
+	// Resolve who should receive the reminder
+	contactName := "you"
+	contactJID := chat.String()
+	if mode == "direct" {
+		contactName = "you"
+		// For direct reminders, the recipient is the person who asked (the chat's user)
+		// We send to the same chat, so contactJID stays as chat
+	}
+	// created_by tracks who asked (used in Max's alert)
+	createdByJID := chat.String()
+
+	// Persist the reminder
+	if err := b.storeReminder(now, fireAt, contactJID, contactName, action, createdByJID, mode); err != nil {
+		b.sendAcknowledgment(chat, "❌ Failed to store reminder: "+err.Error())
+		return
+	}
+
+	// Schedule the cron trigger for this reminder
+	if err := b.scheduleReminderCron(fireAt, contactJID, action, mode); err != nil {
+		b.sendAcknowledgment(chat, "⚠️ Reminder saved but failed to schedule the delivery: "+err.Error())
+		return
+	}
+
+	// Confirm to the user conversationally
+	if mode == "direct" {
+		b.sendAcknowledgment(chat, fmt.Sprintf("Got it. I'll message you at %s to: %s", fireAt.Format("3:04 PM"), action))
+	} else {
+		b.sendAcknowledgment(chat, fmt.Sprintf("Got it. I'll remind %s at %s to: %s", contactName, fireAt.Format("3:04 PM"), action))
+	}
+}
+
+// parseReminderText extracts fire_at, action text, and mode from the reminder command text.
+func (b *Bot) parseReminderText(text string, now time.Time) (fireAt time.Time, action string, mode string, err error) {
+	lower := strings.ToLower(text)
+
+	// default mode
+	mode = "remind_max"
+
+	// Detect "directly" -> mode = direct
+	if strings.Contains(lower, "directly") {
+		mode = "direct"
+	}
+
+	// Strip the mode word before parsing the time/action
+	text = strings.ReplaceAll(text, "directly", "")
+	text = strings.TrimSpace(text)
+
+	// Time parsing: try multiple patterns
+	fireAt, err = parseReminderTime(text, now)
+	if err != nil {
+		return time.Time{}, "", "", fmt.Errorf("couldn't figure out when: %v", err)
+	}
+
+	// Action: everything after the time spec
+	action = extractAction(text, fireAt, now)
+	if action == "" {
+		return time.Time{}, "", "", fmt.Errorf("no action specified")
+	}
+
+	return fireAt, action, mode, nil
+}
+
+// parseReminderTime tries to extract a concrete time from the reminder text.
+func parseReminderTime(text string, now time.Time) (time.Time, error) {
+	lower := strings.ToLower(text)
+
+	// Relative: "in N minutes"
+	if matched := regexp.MustCompile(`(?i)in\s+(\d+)\s+min`).FindStringSubmatch(text); matched != nil {
+		mins, _ := strconv.Atoi(matched[1])
+		return now.Add(time.Duration(mins) * time.Minute), nil
+	}
+	if matched := regexp.MustCompile(`(?i)in\s+(\d+)\s+minutes`).FindStringSubmatch(text); matched != nil {
+		mins, _ := strconv.Atoi(matched[1])
+		return now.Add(time.Duration(mins) * time.Minute), nil
+	}
+
+	// Relative: "in N hours"
+	if matched := regexp.MustCompile(`(?i)in\s+(\d+)\s+hrs?`).FindStringSubmatch(text); matched != nil {
+		hrs, _ := strconv.Atoi(matched[1])
+		return now.Add(time.Duration(hrs) * time.Hour), nil
+	}
+	if matched := regexp.MustCompile(`(?i)in\s+(\d+)\s+hours?`).FindStringSubmatch(text); matched != nil {
+		hrs, _ := strconv.Atoi(matched[1])
+		return now.Add(time.Duration(hrs) * time.Hour), nil
+	}
+
+	// Relative: "in N seconds"
+	if matched := regexp.MustCompile(`(?i)in\s+(\d+)\s+secs?`).FindStringSubmatch(text); matched != nil {
+		secs, _ := strconv.Atoi(matched[1])
+		return now.Add(time.Duration(secs) * time.Second), nil
+	}
+
+	// Absolute time of day: "at HH:MM" or "at H:MM" (today or tomorrow)
+	if matched := regexp.MustCompile(`(?i)at\s+(\d{1,2}):(\d{2})`).FindStringSubmatch(text); matched != nil {
+		hour, _ := strconv.Atoi(matched[1])
+		min, _ := strconv.Atoi(matched[2])
+		t := time.Date(now.Year(), now.Month(), now.Day(), hour, min, 0, 0, now.Location())
+		if t.Before(now) {
+			t = t.Add(24 * time.Hour)
+		}
+		return t, nil
+	}
+
+	// "at HH:MM AM/PM"
+	if matched := regexp.MustCompile(`(?i)at\s+(\d{1,2}):(\d{2})\s*(am|pm)?`).FindStringSubmatch(text); matched != nil {
+		hour, _ := strconv.Atoi(matched[1])
+		min, _ := strconv.Atoi(matched[2])
+		ampm := strings.ToLower(matched[3])
+		if ampm == "pm" && hour < 12 {
+			hour += 12
+		} else if ampm == "am" && hour == 12 {
+			hour = 0
+		}
+		t := time.Date(now.Year(), now.Month(), now.Day(), hour, min, 0, 0, now.Location())
+		if t.Before(now) {
+			t = t.Add(24 * time.Hour)
+		}
+		return t, nil
+	}
+
+	// "tomorrow at ..."
+	tomorrow := now.Add(24 * time.Hour)
+	if strings.Contains(lower, "tomorrow") {
+		if matched := regexp.MustCompile(`(?i)(\d{1,2}):(\d{2})`).FindStringSubmatch(text); matched != nil {
+			hour, _ := strconv.Atoi(matched[1])
+			min, _ := strconv.Atoi(matched[2])
+			return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), hour, min, 0, 0, now.Location()), nil
+		}
+		// "tomorrow" alone -> tomorrow at the same time as now
+		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), now.Hour(), now.Minute(), 0, 0, now.Location()), nil
+	}
+
+	// "on YYYY-MM-DD [at HH:MM]"
+	if matched := regexp.MustCompile(`(?i)on\s+(\d{4}-\d{2}-\d{2})`).FindStringSubmatch(text); matched != nil {
+		parts := strings.Split(matched[1], "-")
+		if len(parts) != 3 {
+			return time.Time{}, fmt.Errorf("bad date")
+		}
+		y, _ := strconv.Atoi(parts[0])
+		m, _ := strconv.Atoi(parts[1])
+		d, _ := strconv.Atoi(parts[2])
+		t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, now.Location())
+		if t.Before(now) {
+			t = t.Add(24 * time.Hour)
+		}
+		// also look for time-of-day on the same string
+		if matched2 := regexp.MustCompile(`(?i)(\d{1,2}):(\d{2})`).FindStringSubmatch(text); matched2 != nil {
+			hour, _ := strconv.Atoi(matched2[1])
+			min, _ := strconv.Atoi(matched2[2])
+			t = time.Date(y, time.Month(m), d, hour, min, 0, 0, now.Location())
+			if t.Before(now) {
+				t = t.Add(24 * time.Hour)
+			}
+		}
+		return t, nil
+	}
+
+	// Absolute datetime "YYYY-MM-DD HH:MM"
+	if matched := regexp.MustCompile(`(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})`).FindStringSubmatch(text); matched != nil {
+		y, _ := strconv.Atoi(matched[1][:4])
+		m, _ := strconv.Atoi(matched[1][5:7])
+		d, _ := strconv.Atoi(matched[1][8:10])
+		hour, _ := strconv.Atoi(matched[2])
+		min, _ := strconv.Atoi(matched[3])
+		t := time.Date(y, time.Month(m), d, hour, min, 0, 0, now.Location())
+		if t.Before(now) {
+			t = t.Add(24 * time.Hour)
+		}
+		return t, nil
+	}
+
+	return time.Time{}, fmt.Errorf("couldn't parse a time (try 'in 20 minutes', 'at 3pm', 'tomorrow at 10am', or 'on 2026-09-25 at 3pm')")
+}
+
+// extractAction returns everything in the text that is not the time specification.
+func extractAction(text string, _ time.Time, _ time.Time) string {
+	// Remove common time prefixes to leave the action
+	cleaned := text
+	cleaned = regexp.MustCompile(`(?i)\s*in\s+\d+\s+(min|mins|minutes|sec|secs|seconds|hrs?|hours?)\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`(?i)\s*at\s+\d{1,2}:\d{2}\s*(am|pm)?\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`(?i)\s*at\s+\d{1,2}:\d{2}\s*(am|pm)?\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`(?i)\s*tomorrow\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`(?i)\s*on\s+\d{4}-\d{2}-\d{2}\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`(?i)\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s*`).ReplaceAllString(cleaned, " ")
+	cleaned = strings.TrimSpace(cleaned)
+
+	// strip leading "to " if present
+	cleaned = strings.TrimPrefix(cleaned, "to ")
+	cleaned = strings.TrimPrefix(cleaned, "to")
+
+	// strip leading "remind" / "remind me" / "remember"
+	cleaned = regexp.MustCompile(`(?i)^remind(me)?\s*`).ReplaceAllString(cleaned, "")
+	cleaned = regexp.MustCompile(`(?i)^remember\s*`).ReplaceAllString(cleaned, "")
+	cleaned = strings.TrimSpace(cleaned)
+
+	// strip trailing "directly" if present
+	cleaned = strings.ReplaceAll(cleaned, "directly", "")
+	cleaned = strings.TrimSpace(cleaned)
+
+	if cleaned == "" {
+		return ""
+	}
+	return cleaned
+}
+
+// storeReminder inserts a reminder row into the DB.
+func (b *Bot) storeReminder(createdAt, fireAt time.Time, contactJID, contactName, action, createdByJID, mode string) error {
+	_, err := b.SqlDB.Exec(
+		"INSERT INTO reminders (created_at, fire_at, contact_jid, contact_name, message, created_by_jid, mode) VALUES (?,?,?,?,?,?,?)",
+		createdAt, fireAt, contactJID, contactName, action, createdByJID, mode,
+	)
+	return err
+}
+
+// scheduleReminderCron registers a one-shot cron job to fire the reminder at fireAt.
+func (b *Bot) scheduleReminderCron(fireAt time.Time, contactJID, action string, mode string) error {
+	// Use a cron expression that matches fireAt's wall-clock time, plus a safety second.
+	cronExpr := fmt.Sprintf("%d %d %d %d %d", fireAt.Second(), fireAt.Minute(), fireAt.Hour(), fireAt.Day(), int(fireAt.Month()))
+	_, err := b.cron.AddFunc(cronExpr, func() {
+		b.fireReminder(contactJID, action, mode)
+	})
+	return err
+}
+
+// fireReminder sends the reminder message to the configured recipient.
+func (b *Bot) fireReminder(chatID string, action string, mode string) {
+	targetJID, err := wtypes.ParseJID(chatID)
+	if err != nil {
+		log.Error().Err(err).Msgf("fireReminder: invalid target JID %s", chatID)
+		return
+	}
+
+	if mode == "direct" {
+		// Message the recipient directly
+		msg := fmt.Sprintf("⏰ *Reminder*\n\n%s", action)
+		if err := b.sendAcknowledgment(targetJID, msg); err != nil {
+			log.Error().Err(err).Msgf("fireReminder: failed to send direct reminder to %s", chatID)
+		}
+		log.Info().Msgf("Reminder fired (direct) to %s: %s", chatID, action)
+	} else {
+		// Default: remind Max, with context about who asked and what they wanted
+		maxJID, err := wtypes.ParseJID(b.humanAssistantJID)
+		if err != nil {
+			log.Error().Err(err).Msg("fireReminder: cannot parse HUMAN_ASSISTANT_JID")
+			return
+		}
+		// Look up the contact name from the reminders table for nicer output
+		var contactName string
+		b.SqlDB.QueryRow("SELECT contact_name FROM reminders WHERE contact_jid = ? AND fired = 0 LIMIT 1", chatID).Scan(&contactName)
+		if contactName == "" {
+			contactName = "someone"
+		}
+		msg := fmt.Sprintf("⏰ *Reminder*\n\n%s asked you to remind %s: %s\n\nUse `!remind %s` to send the reminder to them directly, or handle it yourself.",
+			contactName, contactName, action, chatID)
+		if err := b.sendAcknowledgment(maxJID, msg); err != nil {
+			log.Error().Err(err).Msg("fireReminder: failed to send reminder to Max")
+		}
+		log.Info().Msgf("Reminder fired (to Max) for %s: %s", chatID, action)
+
+		// Mark fired so we don't re-alert on every cron tick
+		b.SqlDB.Exec("UPDATE reminders SET fired = 1 WHERE contact_jid = ? AND fired = 0", chatID)
+	}
+}
+
+// listReminders lists pending (unfired) reminders to the requester.
+func (b *Bot) listReminders(chat wtypes.JID) {
+	rows, err := b.SqlDB.Query("SELECT id, fire_at, contact_name, message, mode FROM reminders WHERE fired = 0 ORDER BY fire_at ASC")
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't load reminders.")
+		return
+	}
+	defer rows.Close()
+
+	var builder strings.Builder
+	builder.WriteString("⏰ *Pending Reminders:*\n\n")
+	found := false
+	for rows.Next() {
+		var id int
+		var fireAt time.Time
+		var contactName, message, mode string
+		if err := rows.Scan(&id, &fireAt, &contactName, &message, &mode); err != nil {
+			continue
+		}
+		found = true
+		targetLabel := "you"
+		if mode == "remind_max" {
+			targetLabel = "Max (you)"
+		} else {
+			targetLabel = contactName
+		}
+		builder.WriteString(fmt.Sprintf("- [%d] %s → %s : %s\n", id, fireAt.Format("Mon 3:04 PM"), targetLabel, message))
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("listReminders: rows iteration error")
+	}
+	if !found {
+		builder.WriteString("No pending reminders.\n")
+	}
+	b.sendAcknowledgment(chat, builder.String())
+}
+
+// cancelReminder cancels a pending reminder by ID.
+func (b *Bot) cancelReminder(chat wtypes.JID, idStr string) {
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Reminder ID must be a number. List them with `!reminders`.")
+		return
+	}
+	result, err := b.SqlDB.Exec("DELETE FROM reminders WHERE id = ? AND fired = 0", id)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't cancel that reminder.")
+		return
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		b.sendAcknowledgment(chat, "No pending reminder with that ID.")
+		return
+	}
+	b.sendAcknowledgment(chat, fmt.Sprintf("✅ Reminder #%d cancelled.", id))
+}
+
+// --- TASK tags ---
+
+// handleTaskCommand stores a task and delivers a confirmation.
+// Usage: !task <description>
+func (b *Bot) handleTaskCommand(chat wtypes.JID, rawText string) {
+	text := strings.TrimSpace(rawText)
+	if text == "" {
+		b.sendAcknowledgment(chat, "Usage: !task <description>")
+		return
+	}
+	contactJID := chat.String()
+	contactName := "you"
+	if conv, ok := b.conversations[contactJID]; ok && conv.UserName != "" {
+		contactName = conv.UserName
+	}
+	createdByJID := chat.String()
+	now := time.Now()
+
+	_, err := b.SqlDB.Exec(
+		"INSERT INTO tasks (created_at, contact_jid, contact_name, task, created_by_jid, done) VALUES (?,?,?,?,?,?)",
+		now, contactJID, contactName, text, createdByJID, 0,
+	)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Failed to store task: "+err.Error())
+		return
+	}
+	b.sendAcknowledgment(chat, fmt.Sprintf("✅ Task noted: %s", text))
+}
+
+// listTasks lists unfinished tasks for the requester.
+func (b *Bot) listTasks(chat wtypes.JID) {
+	contactJID := chat.String()
+	rows, err := b.SqlDB.Query(
+		"SELECT id, task, created_at FROM tasks WHERE contact_jid = ? AND done = 0 ORDER BY created_at ASC",
+		contactJID,
+	)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't load tasks.")
+		return
+	}
+	defer rows.Close()
+
+	var builder strings.Builder
+	builder.WriteString("📋 *Your Tasks:*\n\n")
+	found := false
+	for rows.Next() {
+		var id int
+		var task string
+		var created time.Time
+		if err := rows.Scan(&id, &task, &created); err != nil {
+			continue
+		}
+		found = true
+		builder.WriteString(fmt.Sprintf("- [ ] [%d] %s (added %s)\n", id, task, created.Format("Mon 3:04 PM")))
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("listTasks: rows iteration error")
+	}
+	if !found {
+		builder.WriteString("No pending tasks.\n")
+	}
+	b.sendAcknowledgment(chat, builder.String())
+}
+
+// markTaskDone marks a task as done by ID.
+func (b *Bot) markTaskDone(chat wtypes.JID, idStr string) {
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Task ID must be a number. List them with `!todo`.")
+		return
+	}
+	result, err := b.SqlDB.Exec("UPDATE tasks SET done = 1 WHERE id = ? AND contact_jid = ? AND done = 0", id, chat.String())
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't mark that task done.")
+		return
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		b.sendAcknowledgment(chat, "No unfinished task with that ID, or it belongs to someone else.")
+		return
+	}
+	b.sendAcknowledgment(chat, fmt.Sprintf("✅ Task #%d marked done.", id))
+}
+
+// processAITaskTags scans the AI response for [TASK:...] tags, stores tasks, strips the tags.
+// Pattern: [TASK:buy groceries]
+func (b *Bot) processAITaskTags(chat wtypes.JID, response string, chatID string) (cleaned string, tasksCreated int) {
+	lower := strings.ToLower(response)
+	if !strings.Contains(lower, "[task:") {
+		return response, 0
+	}
+	count := 0
+	for {
+		idx := strings.Index(strings.ToLower(response), "[task:")
+		if idx == -1 {
+			break
+		}
+		endIdx := strings.Index(response[idx:], "]")
+		if endIdx == -1 {
+			break
+		}
+		fullTag := response[idx : idx+endIdx+1]
+		payload := strings.TrimSpace(fullTag[len("[task:") : len(fullTag)-1])
+		if payload != "" {
+			contactJID := chat.String()
+			contactName := "you"
+			if conv, ok := b.conversations[chatID]; ok && conv.UserName != "" {
+				contactName = conv.UserName
+			}
+			now := time.Now()
+			_, err := b.SqlDB.Exec(
+				"INSERT INTO tasks (created_at, contact_jid, contact_name, task, created_by_jid, done) VALUES (?,?,?,?,?,?)",
+				now, contactJID, contactName, payload, chatID, 0,
+			)
+			if err == nil {
+				count++
+				log.Info().Msgf("AI-created task: %q for %s", payload, contactName)
+			} else {
+				log.Warn().Err(err).Msgf("AI task tag store failed for payload: %q", payload)
+			}
+		}
+		response = response[:idx] + response[idx+endIdx+1:]
+		response = strings.TrimSpace(response)
+	}
+	return response, count
+}
+
+// --- NOTE tags ---
+
+// handleNoteCommand stores a note and delivers a confirmation.
+// Usage: !note <description>
+func (b *Bot) handleNoteCommand(chat wtypes.JID, rawText string) {
+	text := strings.TrimSpace(rawText)
+	if text == "" {
+		b.sendAcknowledgment(chat, "Usage: !note <description>")
+		return
+	}
+	contactJID := chat.String()
+	contactName := "you"
+	if conv, ok := b.conversations[contactJID]; ok && conv.UserName != "" {
+		contactName = conv.UserName
+	}
+	createdByJID := chat.String()
+	now := time.Now()
+
+	_, err := b.SqlDB.Exec(
+		"INSERT INTO notes (created_at, contact_jid, contact_name, note, created_by_jid) VALUES (?,?,?,?,?)",
+		now, contactJID, contactName, text, createdByJID,
+	)
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Failed to store note: "+err.Error())
+		return
+	}
+	b.sendAcknowledgment(chat, fmt.Sprintf("✅ Note saved: %s", text))
+}
+
+// listNotes lists notes for the requester, optionally filtered by a search term.
+func (b *Bot) listNotes(chat wtypes.JID, searchTerm string) {
+	contactJID := chat.String()
+	var rows *sql.Rows
+	var err error
+	if searchTerm != "" {
+		rows, err = b.SqlDB.Query(
+			"SELECT id, note, created_at FROM notes WHERE contact_jid = ? AND note LIKE ? ORDER BY created_at DESC",
+			contactJID, "%"+searchTerm+"%",
+		)
+	} else {
+		rows, err = b.SqlDB.Query(
+			"SELECT id, note, created_at FROM notes WHERE contact_jid = ? ORDER BY created_at DESC",
+			contactJID,
+		)
+	}
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't load notes.")
+		return
+	}
+	defer rows.Close()
+
+	var builder strings.Builder
+	if searchTerm != "" {
+		builder.WriteString(fmt.Sprintf("📝 *Notes matching \"%s\":*\n\n", searchTerm))
+	} else {
+		builder.WriteString("📝 *Your Notes:*\n\n")
+	}
+	found := false
+	for rows.Next() {
+		var id int
+		var note string
+		var created time.Time
+		if err := rows.Scan(&id, &note, &created); err != nil {
+			continue
+		}
+		found = true
+		builder.WriteString(fmt.Sprintf("- [%d] %s (added %s)\n", id, note, created.Format("Mon 3:04 PM")))
+	}
+	if !found {
+		builder.WriteString("No notes found.\n")
+	}
+	b.sendAcknowledgment(chat, builder.String())
+}
+
+// processAINoteTags scans the AI response for [NOTE:...] tags, stores notes, strips the tags.
+// Pattern: [NOTE:Wilma prefers morning calls]
+func (b *Bot) processAINoteTags(chat wtypes.JID, response string, chatID string) (cleaned string, notesCreated int) {
+	lower := strings.ToLower(response)
+	if !strings.Contains(lower, "[note:") {
+		return response, 0
+	}
+	count := 0
+	for {
+		idx := strings.Index(strings.ToLower(response), "[note:")
+		if idx == -1 {
+			break
+		}
+		endIdx := strings.Index(response[idx:], "]")
+		if endIdx == -1 {
+			break
+		}
+		fullTag := response[idx : idx+endIdx+1]
+		payload := strings.TrimSpace(fullTag[len("[note:") : len(fullTag)-1])
+		if payload != "" {
+			contactJID := chat.String()
+			contactName := "you"
+			if conv, ok := b.conversations[chatID]; ok && conv.UserName != "" {
+				contactName = conv.UserName
+			}
+			now := time.Now()
+			_, err := b.SqlDB.Exec(
+				"INSERT INTO notes (created_at, contact_jid, contact_name, note, created_by_jid) VALUES (?,?,?,?,?)",
+				now, contactJID, contactName, payload, chatID,
+			)
+			if err == nil {
+				count++
+				log.Info().Msgf("AI-created note: %q for %s", payload, contactName)
+			} else {
+				log.Warn().Err(err).Msgf("AI note tag store failed for payload: %q", payload)
+			}
+		}
+		response = response[:idx] + response[idx+endIdx+1:]
+		response = strings.TrimSpace(response)
+	}
+	return response, count
+}
+
+// resolveContactJIDByChat returns the best JID to reach the person in the given chat.
+// For 1:1 chats this is the chat JID; for groups it's the chat JID (message the group).
+func (b *Bot) resolveContactJIDByChat(chat wtypes.JID, _ string) string {
+	return chat.String()
+}
+
+// processAIReminderTags scans the AI response for [REMINDER:...] tags, stores reminders,
+// strips the tag from the response, and returns the cleaned response.
+// Pattern: [REMINDER:at 3pm to call George]  or  [REMINDER:tomorrow at 10am to email Wilma directly]
+func (b *Bot) processAIReminderTags(chat wtypes.JID, response string, chatID string) (cleaned string, remindersCreated int) {
+	lower := strings.ToLower(response)
+	if !strings.Contains(lower, "[reminder:") {
+		return response, 0
+	}
+
+	count := 0
+	for {
+		idx := strings.Index(strings.ToLower(response), "[reminder:")
+		if idx == -1 {
+			break
+		}
+		endIdx := strings.Index(response[idx:], "]")
+		if endIdx == -1 {
+			break
+		}
+		fullTag := response[idx : idx+endIdx+1]
+		payload := strings.TrimSpace(fullTag[len("[reminder:") : len(fullTag)-1])
+
+		// Parse the payload the same way as !remind
+		now := time.Now()
+		fireAt, action, mode, pErr := b.parseReminderText(payload, now)
+		if pErr == nil && action != "" {
+			contactJID := chat.String()
+			contactName := "you"
+			// Try to extract a contact name if the action references someone
+			contactName = guessContactName(action)
+			if err := b.storeReminder(now, fireAt, contactJID, contactName, action, chatID, mode); err == nil {
+				b.scheduleReminderCron(fireAt, contactJID, action, mode)
+				count++
+				log.Info().Msgf("AI-created reminder: fireAt=%s action=%q mode=%s", fireAt.Format(time.RFC3339), action, mode)
+			}
+		} else {
+			log.Warn().Err(pErr).Msgf("AI reminder tag parse failed for payload: %q", payload)
+		}
+
+		// Strip the tag
+		response = response[:idx] + response[idx+endIdx+1:]
+		response = strings.TrimSpace(response)
+	}
+	return response, count
+}
+
+// guessContactName tries to extract a person name from the action string.
+// Very simple: if the action looks like "call X" or "email X" or "message X", return X.
+func guessContactName(action string) string {
+	lower := strings.ToLower(action)
+	for _, prefix := range []string{"call ", "email ", "message ", "text ", "remind ", "tell ", "ping ", "notify ", "ask "} {
+		if strings.HasPrefix(lower, prefix) {
+			rest := strings.TrimPrefix(action, prefix)
+			rest = strings.TrimSpace(rest)
+			// Take the first word (the name)
+			parts := strings.Fields(rest)
+			if len(parts) > 0 {
+				return parts[0]
+			}
+		}
+	}
+	return "you"
+}
+
+// triggerDailyReminderCheck runs once per minute to fire any reminders whose time has come.
+// It complements the cron-scheduled path (which handles exact cron matches) by catching
+// reminders that may have been stored but whose cron job didn't register (e.g. edge cases).
+func (b *Bot) triggerDailyReminderCheck() {
+	now := time.Now()
+	rows, err := b.SqlDB.Query("SELECT id, contact_jid, message, mode FROM reminders WHERE fired = 0 AND fire_at <= ?", now)
+	if err != nil {
+		log.Error().Err(err).Msg("triggerDailyReminderCheck: query failed")
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int
+		var contactJID, message, mode string
+		if err := rows.Scan(&id, &contactJID, &message, &mode); err != nil {
+			continue
+		}
+		b.fireReminder(contactJID, message, mode)
+		// Mark fired
+		b.SqlDB.Exec("UPDATE reminders SET fired = 1 WHERE id = ?", id)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("triggerDailyReminderCheck: rows iteration error")
+	}
+}
+
+// Reminder summary command: !reminders
+func (b *Bot) remindCommand(chat wtypes.JID, text string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "!reminders" || lower == "!r" {
+		b.listReminders(chat)
+		return
+	}
+	// !reminders cancel <id>
+	if strings.HasPrefix(lower, "!reminders cancel") || strings.HasPrefix(lower, "!r cancel") {
+		parts := strings.Fields(text)
+		if len(parts) >= 3 {
+			b.cancelReminder(chat, parts[2])
+			return
+		}
+		b.sendAcknowledgment(chat, "Usage: !reminders cancel <id>")
+		return
+	}
+	// Default: show usage
+	b.sendAcknowledgment(chat, "Reminder commands:\n- `!remind in 20 minutes to call George`\n- `!remind at 3pm to call George directly`\n- `!remind tomorrow at 10am to email Wilma`\n- `!reminders`  (list pending)\n- `!reminders cancel <id>`")
+}
+
+// ---------- Depth conversation detection ----------
+
+// isDepthConversation checks whether the recent message history suggests an open-ended,
+// reflective, or substantive conversation rather than a quick practical exchange.
+func isDepthConversation(historyMessages []string) bool {
+	if len(historyMessages) < 3 {
+		return false
+	}
+
+	depthCues := []string{
+		"how do you", "what do you think", "why", "feel", "feelings", "think about",
+		"struggling", "worried", "anxious", "happy", "sad", "upset", "confused",
+		"meaning", "purpose", "struggle", "hurts", "hard", "difficult",
+		"story", "remember", "back when", "used to", "childhood", "grew up",
+		"relationship", "friend", "family", "love", "miss", "lonely",
+		"change", "becoming", "growth", "learn", "teaching me", "help me understand",
+		"advice", "guidance", "support", "through", "going through",
+		"journal", "write", "reflect", "meditation", "therapy",
+	}
+
+	depthCount := 0
+	for _, msg := range historyMessages {
+		lower := strings.ToLower(msg)
+		for _, cue := range depthCues {
+			if strings.Contains(lower, cue) {
+				depthCount++
+				break
+			}
+		}
+	}
+
+	return depthCount >= 2
+}
+
+// buildContactMemorySection loads this contact's stored notes and pending tasks and
+// renders them as a prompt section, so facts the bot recorded via [NOTE:...] and
+// commitments recorded via [TASK:...] actually influence future replies.
+// Without this read-back, both tags are write-only and the feature is inert.
+func (b *Bot) buildContactMemorySection(chatID string) string {
+	var sb strings.Builder
+
+	// Notes: durable facts about this person (most recent 15).
+	noteRows, err := b.SqlDB.Query(
+		"SELECT note FROM notes WHERE contact_jid = ? ORDER BY created_at DESC LIMIT 15",
+		chatID,
+	)
+	if err == nil {
+		defer noteRows.Close()
+		var notes []string
+		for noteRows.Next() {
+			var n string
+			if noteRows.Scan(&n) == nil && strings.TrimSpace(n) != "" {
+				notes = append(notes, strings.TrimSpace(n))
+			}
+		}
+		if err := noteRows.Err(); err != nil {
+			log.Warn().Err(err).Msg("buildContactMemorySection: noteRows iteration error")
+		}
+		if len(notes) > 0 {
+			sb.WriteString("\n### WHAT YOU REMEMBER ABOUT THIS PERSON (saved notes):\n")
+			for i := len(notes) - 1; i >= 0; i-- { // oldest-first reads more naturally
+				fmt.Fprintf(&sb, "- %s\n", notes[i])
+			}
+			sb.WriteString("*Use these naturally when relevant. Do NOT recite the list or announce that you have notes.*\n")
+		}
+	}
+
+	// Tasks: open commitments (most recent 10, oldest first).
+	taskRows, err := b.SqlDB.Query(
+		"SELECT task FROM tasks WHERE contact_jid = ? AND done = 0 ORDER BY created_at ASC LIMIT 10",
+		chatID,
+	)
+	if err == nil {
+		defer taskRows.Close()
+		var tasks []string
+		for taskRows.Next() {
+			var t string
+			if taskRows.Scan(&t) == nil && strings.TrimSpace(t) != "" {
+				tasks = append(tasks, strings.TrimSpace(t))
+			}
+		}
+		if err := taskRows.Err(); err != nil {
+			log.Warn().Err(err).Msg("buildContactMemorySection: taskRows iteration error")
+		}
+		if len(tasks) > 0 {
+			sb.WriteString("\n### OPEN TASKS / COMMITMENTS FOR THIS PERSON:\n")
+			for _, t := range tasks {
+				fmt.Fprintf(&sb, "- [ ] %s\n", t)
+			}
+			sb.WriteString("*If the person's message relates to one of these, acknowledge it. Do NOT list them unprompted.*\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// enablePersonaHotReload starts a poller that refreshes persona documents when
+// their source files change on disk, so soul.md/identity.md/personality.md edits
+// apply without a bot restart. truth.md is already re-read per message.
+func (b *Bot) enablePersonaHotReload() {
+	personaFiles := map[string]string{
+		"soul.md":        "personality",
+		"personality.md": "personality",
+		"identity.md":    "identity",
+	}
+	// Poll every 30 seconds; stat-only when nothing changed, so cost is negligible.
+	if _, err := b.cron.AddFunc("*/30 * * * * *", func() {
+		b.vectorStore.ReloadDocuments(personaFiles)
+	}); err != nil {
+		log.Error().Err(err).Msg("Failed to schedule persona hot reload")
+		return
+	}
+	log.Info().Msg("Persona hot reload enabled (30s poll on soul.md/identity.md/personality.md)")
+}
+
+// ---------- structured conversation recaps ----------
+
+// recapThreadIdleMinutes is how long a thread must be silent before it counts as ended.
+const recapThreadIdleMinutes = 45
+
+// outageAlertCooldown rate-limits global AI-outage alerts so a sustained outage
+// notifies Max once rather than on every failed request.
+const outageAlertCooldown = 30 * time.Minute
+
+// enableRecapScheduler runs a periodic sweep that writes a structured recap for
+// any conversation that has gone quiet. Thread-end is inferred from inactivity
+// because there is no explicit "conversation over" signal in WhatsApp.
+func (b *Bot) enableRecapScheduler() {
+	if _, err := b.cron.AddFunc("*/10 * * * *", b.sweepEndedThreads); err != nil {
+		log.Error().Err(err).Msg("Failed to schedule recap sweep")
+		return
+	}
+	log.Info().Msg("Structured conversation recaps enabled (10-minute sweep)")
+}
+
+// sweepEndedThreads finds conversations idle past the threshold and recaps them.
+func (b *Bot) sweepEndedThreads() {
+	cutoff := time.Now().Add(-recapThreadIdleMinutes * time.Minute)
+
+	b.mutex.RLock()
+	type candidate struct {
+		chatID   string
+		userName string
+		msgCount int
+	}
+	var pending []candidate
+	for id, conv := range b.conversations {
+		if len(conv.Messages) < 4 {
+			continue
+		}
+		if conv.LastActive.After(cutoff) {
+			continue // still active
+		}
+		pending = append(pending, candidate{chatID: id, userName: conv.UserName, msgCount: len(conv.Messages)})
+	}
+	b.mutex.RUnlock()
+
+	for _, c := range pending {
+		// Skip if we already recapped this exact message count (avoids duplicate
+		// recaps every sweep while a thread stays idle).
+		var existing int
+		b.SqlDB.QueryRow(
+			"SELECT COALESCE(MAX(message_count), 0) FROM conversation_recaps WHERE chat_id = ?",
+			c.chatID,
+		).Scan(&existing)
+		if existing >= c.msgCount {
+			continue
+		}
+		b.generateThreadRecap(c.chatID, c.userName)
+	}
+}
+
+// generateThreadRecap distils the conversation into summary/decisions/commitments/
+// open questions and persists it. Best-effort; never blocks the chat path.
+func (b *Bot) generateThreadRecap(chatID string, userName string) {
+	b.mutex.RLock()
+	conv, ok := b.conversations[chatID]
+	if !ok || len(conv.Messages) < 4 {
+		b.mutex.RUnlock()
+		return
+	}
+	var sb strings.Builder
+	for _, m := range conv.Messages {
+		who := userName
+		if m.Role == "assistant" {
+			who = "maximus"
+		}
+		if who == "" {
+			who = "them"
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s\n", who, CleanResponse(m.Content)))
+	}
+	msgCount := len(conv.Messages)
+	if userName == "" {
+		userName = "Unknown"
+	}
+	b.mutex.RUnlock()
+
+	prompt := fmt.Sprintf(`Summarise this WhatsApp conversation between maximus (an assistant) and %s.
+
+Return EXACTLY these four lines and nothing else:
+SUMMARY: <2 sentences describing what was discussed>
+DECISIONS: <concrete decisions made, semicolon-separated; or NONE>
+COMMITMENTS: <things maximus promised to do, semicolon-separated; or NONE>
+OPEN_QUESTIONS: <unresolved questions or follow-ups needed, semicolon-separated; or NONE>
+
+Be factual and terse. Do not invent anything not present in the conversation.
+
+CONVERSATION:
+%s`, userName, sb.String())
+
+	resp, _, _, err := ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
+	if err != nil {
+		log.Warn().Err(err).Msgf("generateThreadRecap: AI request failed for %s", chatID)
+		return
+	}
+
+	summary, decisions, commitments, questions := parseRecapResponse(resp)
+	if summary == "" && decisions == "" && commitments == "" && questions == "" {
+		log.Warn().Msgf("generateThreadRecap: nothing parsed for %s", chatID)
+		return
+	}
+
+	_, err = b.SqlDB.Exec(
+		`INSERT INTO conversation_recaps
+			(created_at, chat_id, contact_name, message_count, summary, decisions, commitments, open_questions)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		time.Now(), chatID, userName, msgCount, summary, decisions, commitments, questions,
+	)
+	if err != nil {
+		log.Warn().Err(err).Msgf("generateThreadRecap: insert failed for %s", chatID)
+		return
+	}
+	log.Info().Msgf("generateThreadRecap: stored recap for %s (%d messages)", chatID, msgCount)
+}
+
+// parseRecapResponse extracts the four labelled lines from the model output.
+func parseRecapResponse(resp string) (summary, decisions, commitments, questions string) {
+	clean := func(s string) string {
+		s = strings.TrimSpace(s)
+		if strings.EqualFold(s, "NONE") || s == "-" {
+			return ""
+		}
+		return s
+	}
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		upper := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upper, "SUMMARY:"):
+			summary = clean(strings.TrimSpace(line[len("SUMMARY:"):]))
+		case strings.HasPrefix(upper, "DECISIONS:"):
+			decisions = clean(strings.TrimSpace(line[len("DECISIONS:"):]))
+		case strings.HasPrefix(upper, "COMMITMENTS:"):
+			commitments = clean(strings.TrimSpace(line[len("COMMITMENTS:"):]))
+		case strings.HasPrefix(upper, "OPEN_QUESTIONS:"):
+			questions = clean(strings.TrimSpace(line[len("OPEN_QUESTIONS:"):]))
+		}
+	}
+	return summary, decisions, commitments, questions
+}
+
+// buildRecapSection renders recent thread recaps for a contact into the prompt so
+// the bot retains cross-thread continuity beyond the rolling summary.
+func (b *Bot) buildRecapSection(chatID string) string {
+	rows, err := b.SqlDB.Query(
+		"SELECT summary, decisions, commitments, open_questions FROM conversation_recaps WHERE chat_id = ? ORDER BY created_at DESC LIMIT 3",
+		chatID,
+	)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	found := false
+	for rows.Next() {
+		var summary, decisions, commitments, questions string
+		if rows.Scan(&summary, &decisions, &commitments, &questions) != nil {
+			continue
+		}
+		if !found {
+			sb.WriteString("\n### WHAT CAME OUT OF EARLIER CONVERSATIONS (awareness only — do not announce):\n")
+			found = true
+		}
+		if summary != "" {
+			fmt.Fprintf(&sb, "- %s\n", summary)
+		}
+		if decisions != "" {
+			fmt.Fprintf(&sb, "  Decisions: %s\n", decisions)
+		}
+		if commitments != "" {
+			fmt.Fprintf(&sb, "  Promised: %s\n", commitments)
+		}
+		if questions != "" {
+			fmt.Fprintf(&sb, "  Still open: %s\n", questions)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("buildRecapSection: rows iteration error")
+	}
+	if !found {
+		return ""
+	}
+	sb.WriteString("*Do NOT open with these. Only use them if the current message relates.*\n")
+	return sb.String()
+}
+
+// ---------- facts about people (RAG beyond Max) ----------
+
+// storeFact records a fact about a named subject (any person, not just Max).
+func (b *Bot) storeFact(subject, fact, createdByJID string) error {
+	subject = strings.TrimSpace(subject)
+	fact = strings.TrimSpace(fact)
+	if subject == "" || fact == "" {
+		return fmt.Errorf("fact requires both subject and content")
+	}
+	// Dedupe is enforced by the UNIQUE(subject, fact) constraint, so INSERT OR
+	// IGNORE makes this race-safe rather than relying on a check-then-insert.
+	res, err := b.SqlDB.Exec(
+		"INSERT OR IGNORE INTO facts (created_at, subject, fact, created_by_jid) VALUES (?,?,?,?)",
+		time.Now(), subject, fact, createdByJID,
+	)
+	if err != nil {
+		return err
+	}
+	// RowsAffected == 0 means the fact already existed; not an error.
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		log.Debug().Msgf("fact already known about %s: %q", subject, fact)
+	}
+	return nil
+}
+
+// buildFactsSection pulls facts about this contact (and any facts mentioned in
+// this chat) into the prompt so the bot recalls knowledge about people other than Max.
+func (b *Bot) buildFactsSection(chatID, contactName string) string {
+	var sb strings.Builder
+	seen := map[string]bool{}
+
+	collect := func(rows *sql.Rows) {
+		for rows.Next() {
+			var subject, fact string
+			if rows.Scan(&subject, &fact) != nil {
+				continue
+			}
+			key := subject + "|" + fact
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if sb.Len() == 0 {
+				sb.WriteString("\n### FACTS YOU KNOW ABOUT PEOPLE (recall naturally, do not list):\n")
+			}
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", subject, fact))
+		}
+	}
+
+	// Facts about the person currently being spoken to.
+	if contactName != "" && !strings.EqualFold(contactName, "User") && !strings.EqualFold(contactName, "Someone") {
+		if rows, err := b.SqlDB.Query(
+			"SELECT subject, fact FROM facts WHERE subject LIKE ? ORDER BY created_at DESC LIMIT 15",
+			"%"+contactName+"%",
+		); err == nil {
+			collect(rows)
+			rows.Close()
+		}
+	}
+
+	// Facts recorded in this chat, regardless of subject.
+	if rows, err := b.SqlDB.Query(
+		"SELECT subject, fact FROM facts WHERE created_by_jid = ? ORDER BY created_at DESC LIMIT 15",
+		chatID,
+	); err == nil {
+		collect(rows)
+		rows.Close()
+	}
+
+	return sb.String()
+}
+
+// processAIFactTags scans the AI response for [FACT:subject|content] tags and stores
+// them. Pattern: [FACT:Wilma|prefers morning calls]
+func (b *Bot) processAIFactTags(_ wtypes.JID, response string, chatID string) (cleaned string, factsCreated int) {
+	lower := strings.ToLower(response)
+	if !strings.Contains(lower, "[fact:") {
+		return response, 0
+	}
+	count := 0
+	for {
+		idx := strings.Index(strings.ToLower(response), "[fact:")
+		if idx == -1 {
+			break
+		}
+		endIdx := strings.Index(response[idx:], "]")
+		if endIdx == -1 {
+			break // malformed tag with no closer — stop, don't spin
+		}
+		fullTag := response[idx : idx+endIdx+1]
+		payload := strings.TrimSpace(fullTag[len("[fact:") : len(fullTag)-1])
+
+		if parts := strings.SplitN(payload, "|", 2); len(parts) == 2 {
+			subject := strings.TrimSpace(parts[0])
+			content := strings.TrimSpace(parts[1])
+			if subject != "" && content != "" {
+				if err := b.storeFact(subject, content, chatID); err == nil {
+					count++
+					log.Info().Msgf("AI-created fact about %s: %q", subject, content)
+				} else {
+					log.Warn().Err(err).Msgf("AI fact tag store failed: %q", payload)
+				}
+			}
+		} else {
+			log.Warn().Msgf("AI fact tag malformed (expected subject|content): %q", payload)
+		}
+
+		response = response[:idx] + response[idx+endIdx+1:]
+		response = strings.TrimSpace(response)
+	}
+	return response, count
+}
+
+// handleFactAboutCommand stores a fact about a specific person: !fact about <name> <fact>
+func (b *Bot) handleFactAboutCommand(chat wtypes.JID, raw string) {
+	rest := strings.TrimSpace(strings.TrimPrefix(raw, "about"))
+	parts := strings.SplitN(rest, " ", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		b.sendAcknowledgment(chat, "Usage: !fact about <name> <fact>\nExample: !fact about Wilma prefers morning calls")
+		return
+	}
+	subject := strings.TrimSpace(parts[0])
+	content := strings.TrimSpace(parts[1])
+	if err := b.storeFact(subject, content, chat.String()); err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't save that fact: "+err.Error())
+		return
+	}
+	b.sendAcknowledgment(chat, fmt.Sprintf("✅ Noted about %s: %s", subject, content))
+}
+
+// listFacts shows stored facts, optionally filtered by subject.
+func (b *Bot) listFacts(chat wtypes.JID, subject string) {
+	var rows *sql.Rows
+	var err error
+	if subject != "" {
+		rows, err = b.SqlDB.Query(
+			"SELECT subject, fact, created_at FROM facts WHERE subject LIKE ? ORDER BY subject, created_at DESC LIMIT 50",
+			"%"+subject+"%",
+		)
+	} else {
+		rows, err = b.SqlDB.Query(
+			"SELECT subject, fact, created_at FROM facts ORDER BY subject, created_at DESC LIMIT 50",
+		)
+	}
+	if err != nil {
+		b.sendAcknowledgment(chat, "❌ Couldn't load facts.")
+		return
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	if subject != "" {
+		sb.WriteString(fmt.Sprintf("🧠 *Facts matching \"%s\":*\n\n", subject))
+	} else {
+		sb.WriteString("🧠 *Facts about people:*\n\n")
+	}
+	found := false
+	for rows.Next() {
+		var subj, fact string
+		var created time.Time
+		if rows.Scan(&subj, &fact, &created) != nil {
+			continue
+		}
+		found = true
+		sb.WriteString(fmt.Sprintf("- *%s*: %s\n", subj, fact))
+	}
+	if !found {
+		sb.WriteString("No facts stored yet. Add one with `!fact about <name> <fact>`.\n")
+	}
+	b.sendAcknowledgment(chat, sb.String())
+}
+
+// checkGlobalOutage alerts Max once when every AI provider is unavailable.
+// Distinct from the per-chat HITL alert: this fires on a system-wide outage and
+// is rate-limited so a long outage produces one alert, not a stream.
+func (b *Bot) checkGlobalOutage() {
+	tripped := ai.TrippedProviders()
+	if len(tripped) == 0 {
+		return
+	}
+
+	b.mutex.Lock()
+	if time.Now().Before(b.lastOutageAlert.Add(outageAlertCooldown)) {
+		b.mutex.Unlock()
+		return
+	}
+	b.lastOutageAlert = time.Now()
+	b.mutex.Unlock()
+
+	targetJID, err := wtypes.ParseJID(b.humanAssistantJID)
+	if err != nil {
+		log.Error().Err(err).Msg("checkGlobalOutage: cannot parse HUMAN_ASSISTANT_JID")
+		return
+	}
+	msg := fmt.Sprintf("⚠️ *AI PROVIDER OUTAGE*\n\nAll configured AI providers are failing or rate-limited.\nTripped: %s\n\nThe bot is falling back where it can but replies may be degraded or delayed. No action needed unless this persists.",
+		strings.Join(tripped, ", "))
+	if err := b.sendAcknowledgment(targetJID, msg); err != nil {
+		log.Error().Err(err).Msg("checkGlobalOutage: failed to alert Max")
+		return
+	}
+	log.Warn().Strs("tripped", tripped).Msg("Global AI outage alert sent to Max")
+}
+
+// ---------- implicit user preference learning ----------
+
+// userProfile holds implicitly-learned preferences for one contact.
+type userProfile struct {
+	CommunicationStyle string
+	Interests          string
+	Dislikes           string
+}
+
+// loadUserProfile reads a learned profile for the given user, if one exists.
+func (b *Bot) loadUserProfile(userID string) (userProfile, bool) {
+	var p userProfile
+	err := b.SqlDB.QueryRow(
+		"SELECT communication_style, interests, dislikes FROM user_profiles WHERE user_id = ?",
+		userID,
+	).Scan(&p.CommunicationStyle, &p.Interests, &p.Dislikes)
+	if err != nil {
+		return userProfile{}, false
+	}
+	if p.CommunicationStyle == "" && p.Interests == "" && p.Dislikes == "" {
+		return userProfile{}, false
+	}
+	return p, true
+}
+
+// buildProfileSection renders the learned profile as a prompt section.
+func (b *Bot) buildProfileSection(userID string) string {
+	p, ok := b.loadUserProfile(userID)
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n### LEARNED PREFERENCES FOR THIS PERSON (calibrate your tone, do not recite):\n")
+	if p.CommunicationStyle != "" {
+		fmt.Fprintf(&sb, "- Communication style: %s\n", p.CommunicationStyle)
+	}
+	if p.Interests != "" {
+		fmt.Fprintf(&sb, "- Cares about: %s\n", p.Interests)
+	}
+	if p.Dislikes != "" {
+		fmt.Fprintf(&sb, "- Dislikes / avoid: %s\n", p.Dislikes)
+	}
+	return sb.String()
+}
+
+// learnUserPreferences runs periodically (not per message) to distil durable
+// preferences from recent conversation history. Best-effort: failures are logged
+// and never surface to the user.
+func (b *Bot) learnUserPreferences(chatID string) {
+	b.mutex.RLock()
+	conv, ok := b.conversations[chatID]
+	if !ok || len(conv.Messages) < 6 {
+		b.mutex.RUnlock()
+		return
+	}
+	// Use only the recent slice so the prompt stays small.
+	start := 0
+	if len(conv.Messages) > 20 {
+		start = len(conv.Messages) - 20
+	}
+	var sb strings.Builder
+	for _, m := range conv.Messages[start:] {
+		role := "them"
+		if m.Role == "assistant" {
+			role = "you"
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s\n", role, CleanResponse(m.Content)))
+	}
+	userName := conv.UserName
+	b.mutex.RUnlock()
+
+	if userName == "" {
+		userName = "this person"
+	}
+
+	prompt := fmt.Sprintf(`You are analysing a WhatsApp conversation to extract DURABLE preferences about %s (the person, not the assistant).
+
+Return EXACTLY three lines, no preamble, no markdown:
+STYLE: <their communication style in under 12 words, or NONE>
+INTERESTS: <comma-separated topics they genuinely care about, or NONE>
+DISLIKES: <things they dislike or want avoided, or NONE>
+
+Only record what is clearly evidenced in the conversation. Use NONE rather than guessing.
+
+CONVERSATION:
+%s`, userName, sb.String())
+
+	resp, _, _, err := ai.MakeAIRequest(prompt, nil, "", DEFAULT_TIMEOUT)
+	if err != nil {
+		log.Warn().Err(err).Msgf("learnUserPreferences: AI request failed for %s", chatID)
+		return
+	}
+
+	style, interests, dislikes := parseProfileResponse(resp)
+	if style == "" && interests == "" && dislikes == "" {
+		return
+	}
+
+	_, err = b.SqlDB.Exec(`
+		INSERT INTO user_profiles (user_id, display_name, communication_style, interests, dislikes, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET
+			display_name = excluded.display_name,
+			communication_style = CASE WHEN excluded.communication_style != '' THEN excluded.communication_style ELSE user_profiles.communication_style END,
+			interests = CASE WHEN excluded.interests != '' THEN excluded.interests ELSE user_profiles.interests END,
+			dislikes = CASE WHEN excluded.dislikes != '' THEN excluded.dislikes ELSE user_profiles.dislikes END,
+			interaction_count = user_profiles.interaction_count + 1,
+			updated_at = excluded.updated_at`,
+		chatID, userName, style, interests, dislikes, time.Now(),
+	)
+	if err != nil {
+		log.Warn().Err(err).Msgf("learnUserPreferences: upsert failed for %s", chatID)
+		return
+	}
+	log.Info().Msgf("learnUserPreferences: updated profile for %s", chatID)
+}
+
+// parseProfileResponse extracts STYLE/INTERESTS/DISLIKES lines from the model output.
+func parseProfileResponse(resp string) (style, interests, dislikes string) {
+	clean := func(s string) string {
+		s = strings.TrimSpace(s)
+		if strings.EqualFold(s, "NONE") || s == "-" {
+			return ""
+		}
+		return s
+	}
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		upper := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upper, "STYLE:"):
+			style = clean(strings.TrimSpace(line[len("STYLE:"):]))
+		case strings.HasPrefix(upper, "INTERESTS:"):
+			interests = clean(strings.TrimSpace(line[len("INTERESTS:"):]))
+		case strings.HasPrefix(upper, "DISLIKES:"):
+			dislikes = clean(strings.TrimSpace(line[len("DISLIKES:"):]))
+		}
+	}
+	return style, interests, dislikes
+}
+
+// shouldEngageGroup decides whether the bot may respond in a group chat.
+// Default is false: groups conflate multiple people into one conversation.
+// GROUP_ENGAGE=true enables all groups; GROUP_ALLOWLIST restricts to named ones.
+func (b *Bot) shouldEngageGroup(chatJID string) bool {
+	if !b.groupEngage {
+		return false
+	}
+	if len(b.groupAllowlist) == 0 {
+		return true // engage enabled with no allowlist = all groups
+	}
+	return b.groupAllowlist[chatJID]
+}
+
+// resolveGroupSenderName derives a display name for a message inside a group.
+// In groups, Info.Sender is the individual participant while Info.Chat is the
+// group itself, so the sender must come from Sender (falling back to SenderAlt
+// when the primary address is a LID the contact map doesn't know).
+func (b *Bot) resolveGroupSenderName(info wtypes.MessageInfo) string {
+	sender := info.Sender
+	if sender.User == "" && !info.SenderAlt.IsEmpty() {
+		sender = info.SenderAlt
+	}
+	if info.PushName != "" {
+		return info.PushName
+	}
+	return b.resolveSenderName(sender.String())
+}
+
+// ---------- group chat handling ----------
+
+// isGroupChat returns true when the JID ends with @g.us (WhatsApp group JID suffix).
+func isGroupChat(jid string) bool {
+	return strings.HasSuffix(jid, "@g.us")
+}
+
+// ---------- processAIResponse: inject [REMINDER:] tag handling ----------
+
+// enableReminderTagHandling must be called once to register the one-minute reminder check cron.
+func (b *Bot) enableReminderTagHandling() {
+	if _, err := b.cron.AddFunc("* * * * *", b.triggerDailyReminderCheck); err != nil {
+		log.Error().Err(err).Msg("Failed to schedule daily reminder check")
+	}
+	log.Info().Msg("Reminder tag handling enabled (1-minute check)")
+}
+
+// enableTaskNoteTagHandling loads persisted tasks and notes from DB into memory.
+// Called once at startup. No cron needed — tasks/notes are user-managed via commands.
+func (b *Bot) enableTaskNoteTagHandling() {
+	// Verify the tables exist so a schema failure surfaces at startup rather than
+	// on the first user command.
+	if _, err := b.SqlDB.Query("SELECT COUNT(*) FROM notes"); err != nil {
+		log.Error().Err(err).Msg("Task/note tag handling: notes table unavailable")
+	}
+	if _, err := b.SqlDB.Query("SELECT COUNT(*) FROM tasks"); err != nil {
+		log.Error().Err(err).Msg("Task/note tag handling: tasks table unavailable")
+	}
+	log.Info().Msg("Task/note tag handling enabled (notes/tasks read back into prompt)")
+}
+
+// enablePreferenceLearning schedules periodic implicit preference extraction for
+// active conversations. Runs hourly; each run is best-effort and never blocks chat.
+func (b *Bot) enablePreferenceLearning() {
+	if _, err := b.cron.AddFunc("0 * * * *", b.learnAllActiveProfiles); err != nil {
+		log.Error().Err(err).Msg("Failed to schedule preference learning")
+		return
+	}
+	log.Info().Msg("Implicit preference learning enabled (hourly)")
+}
+
+// learnAllActiveProfiles distils preferences for every conversation with enough history.
+func (b *Bot) learnAllActiveProfiles() {
+	b.mutex.RLock()
+	chatIDs := make([]string, 0, len(b.conversations))
+	for id, conv := range b.conversations {
+		if len(conv.Messages) >= 6 {
+			chatIDs = append(chatIDs, id)
+		}
+	}
+	b.mutex.RUnlock()
+
+	for _, id := range chatIDs {
+		b.learnUserPreferences(id)
+	}
+}
+
+// sendReminderToContact sends a direct reminder message to a specific contact JID.
+// Used by !remind <jid> <message> (manual override) and by the cron fire path.
+func (b *Bot) sendReminderToContact(targetJID wtypes.JID, message string) error {
+	msg := utils.CreateTextMessage(message)
+	_, err := b.client.SendMessage(context.Background(), targetJID, msg)
+	return err
+}
+
+// deleteReminder deletes a reminder by ID.
+func (b *Bot) deleteReminder(id int) (bool, error) {
+	result, err := b.SqlDB.Exec("DELETE FROM reminders WHERE id = ? AND fired = 0", id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
+}
