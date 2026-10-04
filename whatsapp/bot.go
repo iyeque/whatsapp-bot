@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1654,18 +1656,41 @@ func (tm *TimeoutManager) getOptimalTimeout() time.Duration {
 	return timeout
 }
 
+// isTimeoutError reports whether a failure was a timeout, so the user gets an
+// accurate explanation. The status code is read structurally where available;
+// string matching is retained for transport-level timeouts.
 func isTimeoutError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return err == context.DeadlineExceeded || strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded")
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var statusErr *ai.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusRequestTimeout ||
+			statusErr.StatusCode == http.StatusGatewayTimeout
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
 }
 
+// isOverloadedError reports whether the provider signalled overload.
+//
+// The status code is read structurally where available. The previous
+// implementation substring-matched a bare "503", which meant any error text
+// containing those digits (a token count, a timestamp, an id) was reported to the
+// user as "the model is overloaded".
 func isOverloadedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "503") || strings.Contains(err.Error(), "overloaded")
+	var statusErr *ai.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusServiceUnavailable ||
+			statusErr.StatusCode == http.StatusBadGateway
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "overloaded")
 }
 
 // Commented out unused method

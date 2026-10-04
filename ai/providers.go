@@ -92,40 +92,41 @@ type breaker struct {
 // errors would penalise a healthy provider for a fault that every provider would
 // hit identically, tripping the breaker on requests that were never going to
 // succeed anywhere.
+//
+// Classification is structural where possible: an *HTTPStatusError carries the
+// real status code, so no guessing is required. String matching is retained only
+// for transport-level failures (DNS, refused connections, TLS), which arrive as
+// opaque *url.Error values with no status code to inspect.
 func isProviderFault(err error) bool {
 	if err == nil {
 		return false
 	}
+
 	// Local pre-flight refusals are never the provider's fault.
 	if errors.Is(err, errClientSide) {
 		return false
 	}
 
+	// Structural classification: trust the status code when we have one.
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		// 4xx (except 408/429) means the request itself was bad; every provider
+		// would reject it identically, so it is not a provider fault.
+		return statusErr.IsRetryable()
+	}
+
+	// Context cancellation and deadline expiry are transport-level timeouts.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// Transport-level failures have no status code, so fall back to matching.
 	msg := strings.ToLower(err.Error())
-
-	// Explicitly client-side: the request itself was wrong.
-	clientSignals := []string{
-		"status 400", "status 401", "status 403", "status 404", "status 422",
-		"invalid_request", "invalid request", "unsupported media", "context length",
-		"maximum context", "too many tokens", "invalid api key",
-		"content policy", "content_policy", "moderation",
-	}
-	for _, s := range clientSignals {
-		if strings.Contains(msg, s) {
-			return false
-		}
-	}
-
-	// Provider-side: transient or server faults worth counting.
-	providerSignals := []string{
-		"status 429", "status 500", "status 502", "status 503", "status 504",
-		"rate limit", "rate_limit", "rate-limited", "too many requests",
-		"overloaded", "timeout", "deadline exceeded", "connection refused",
-		"connection reset", "no such host", "temporary failure",
-		"eof", "unavailable", "internal server error", "bad gateway",
-		"service unavailable", "gateway timeout",
-	}
-	for _, s := range providerSignals {
+	for _, s := range []string{
+		"timeout", "deadline exceeded", "connection refused", "connection reset",
+		"no such host", "temporary failure", "broken pipe", "network is unreachable",
+		"eof", "tls handshake", "server misbehaving",
+	} {
 		if strings.Contains(msg, s) {
 			return true
 		}
@@ -344,49 +345,21 @@ type localProvider struct{}
 
 func (l *localProvider) Name() string { return "local" }
 
-func isRateLimitError(err error, body []byte) bool {
+// isRateLimitFailure reports whether an error represents provider throttling.
+//
+// The status code is read structurally when the error carries one. The string
+// check is a fallback for transport-level failures that surface the code only in
+// the error text.
+func isRateLimitFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	// Catch HTTP 429 status in error string (various HTTP client formats)
-	if strings.Contains(errStr, "429") {
-		return true
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.IsRateLimit()
 	}
-	// Catch OpenRouter-specific rate limit error format
-	if strings.Contains(errStr, "rate_limit_exceeded") || strings.Contains(errStr, "rate-limited") {
-		return true
-	}
-	var parsed map[string]interface{}
-	if body != nil && json.Unmarshal(body, &parsed) == nil {
-		if code, ok := parsed["code"].(string); ok && code == "token_quota_exceeded" {
-			return true
-		}
-		if msg, ok := parsed["message"].(string); ok {
-			if strings.Contains(msg, "Tokens per minute limit exceeded") || strings.Contains(msg, "rate_limit_exceeded") || strings.Contains(msg, "rate-limited") {
-				return true
-			}
-		}
-		// OpenRouter nested error format
-		if meta, ok := parsed["metadata"].(map[string]interface{}); ok {
-			if raw, ok := meta["raw"].(string); ok && strings.Contains(raw, "rate-limited") {
-				return true
-			}
-		}
-		// Direct 429 code in response
-		if code, ok := parsed["code"].(float64); ok && code == 429 {
-			return true
-		}
-		if code, ok := parsed["error"].(map[string]interface{}); ok {
-			if c, ok := code["code"].(float64); ok && c == 429 {
-				return true
-			}
-			if c, ok := code["code"].(string); ok && c == "rate_limit_exceeded" {
-				return true
-			}
-		}
-	}
-	return false
+	// Transport-level: no status code available, so inspect the message.
+	return hasRateLimitPhrase(err.Error())
 }
 
 func callLMStudio(ctx context.Context, prompt string, mediaData []byte, mimeType string, _ time.Duration) (string, int, time.Duration, error) {
@@ -523,9 +496,11 @@ func callOpenRouter(ctx context.Context, prompt string, mediaData []byte, mimeTy
 	bodyBytes, err := client.PostJSON(ctx, endpoint, headers, body)
 	latency := time.Since(start)
 	if err != nil {
-		// Detect 429 in the error string too (some HTTP clients include the status code in the error message)
-		if isRateLimitError(err, nil) {
-			log.Warn().Str("endpoint", endpoint).Msg("OpenRouter returned 429 (network error) — attempting fallback to LM Studio")
+		// A rate limit is a provider fault worth falling back for. The status
+		// code is read structurally when present; transport-level 429s (where the
+		// code only appears in the error text) are caught by the helper.
+		if isRateLimitFailure(err) {
+			log.Warn().Str("endpoint", endpoint).Msg("OpenRouter rate-limited — attempting fallback to LM Studio")
 			lmText, lmTokens, lmLatency, lmErr := callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
 			if lmErr == nil {
 				return lmText, lmTokens, lmLatency, nil
@@ -535,9 +510,10 @@ func callOpenRouter(ctx context.Context, prompt string, mediaData []byte, mimeTy
 		return "", 0, latency, fmt.Errorf("OpenRouter request failed: %w; body: %s", err, string(bodyBytes))
 	}
 
-	// Detect rate-limit (429) in the response body and fall back to LM Studio
-	if strings.Contains(string(bodyBytes), `"code":429`) || strings.Contains(string(bodyBytes), `"status":429`) || strings.Contains(string(bodyBytes), "rate_limit_exceeded") || strings.Contains(string(bodyBytes), "rate-limited") {
-		log.Warn().Str("endpoint", endpoint).Msg("OpenRouter returned 429 — attempting fallback to LM Studio")
+	// Some providers return HTTP 200 with a rate-limit error in the payload, so
+	// the body is inspected for a throttling signal.
+	if bodyIndicatesRateLimit(bodyBytes) {
+		log.Warn().Str("endpoint", endpoint).Msg("OpenRouter rate-limited (in body) — attempting fallback to LM Studio")
 		lmText, lmTokens, lmLatency, lmErr := callLMStudio(ctx, prompt, mediaData, mimeType, timeout)
 		if lmErr == nil {
 			return lmText, lmTokens, lmLatency, nil
@@ -1013,8 +989,10 @@ func (g *geminiProvider) Generate(ctx context.Context, prompt string, mediaData 
 				break
 			}
 
-			// If it's a 429, wait and retry
-			if strings.Contains(err.Error(), "429") {
+			// If it's a 429, wait and retry. The status code is read structurally
+			// where available, so a "429" appearing incidentally in a prompt or a
+			// model name can no longer be mistaken for throttling.
+			if isRateLimitFailure(err) {
 				backoff := time.Duration(1<<retry) * 2 * time.Second
 				log.Warn().Str("model", m).Msgf("Gemini rate limited (429). Retrying in %v...", backoff)
 				time.Sleep(backoff)
